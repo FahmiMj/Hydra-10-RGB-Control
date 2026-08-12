@@ -7,6 +7,11 @@ Electron and WebHID, it streams lighting frames to the board in real time at
 
 ![Arc Console screenshot](docs/screenshot.png)
 
+> **Try it in your browser** — no install needed: open the
+> [live in-browser demo](https://fahmimj.github.io/Hydra-10-RGB-Control/)
+> in Chrome, Edge, or Brave (WebHID requires a secure context and a
+> Chromium-based browser).
+
 ## Features
 
 - **8 lighting effects** — Off, Solid, Breathing, Spectrum Cycle, Rainbow,
