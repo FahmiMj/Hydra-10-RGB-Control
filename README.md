@@ -79,6 +79,13 @@ npm run dist:win    # produces NSIS installer + portable exe in release/
   `Linked`; if the strategy was auto-negotiated as an output report, the
   diagnostics panel will show which report is in use.
 
+## Credits
+
+The key-to-LED mapping and protocol details are based on MRtojisan's
+[portronics-hydra-10-SignalRGB-Plugin](https://github.com/MRtojisan/portronics-hydra-10-SignalRGB-Plugin) —
+an unofficial SignalRGB plugin for the Portronics Hydra 10. Check it out if
+you want full desktop synchronization and game sync via SignalRGB.
+
 ## License
 
 [MIT](LICENSE)
