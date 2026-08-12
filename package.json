@@ -1,0 +1,62 @@
+{
+  "name": "arc-console",
+  "productName": "Arc Console",
+  "version": "1.0.0",
+  "description": "RGB control console for the Portronics Hydra 10 keyboard (WebHID)",
+  "main": "main.js",
+  "author": "Fahmi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FahmiMj/Hydra-10-RGB-Control.git"
+  },
+  "keywords": [
+    "electron",
+    "webhid",
+    "rgb",
+    "keyboard",
+    "portronics",
+    "hydra-10"
+  ],
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist:win": "electron-builder --win nsis portable -c.win.signAndEditExecutable=false"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.fahmi.arcconsole",
+    "productName": "Arc Console",
+    "files": [
+      "main.js",
+      "index.html",
+      "core.js",
+      "ticker.js",
+      "ui.js",
+      "style.css"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "artifactName": "${productName}-${version}-${target}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-${version}-setup-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
+    }
+  }
+}
