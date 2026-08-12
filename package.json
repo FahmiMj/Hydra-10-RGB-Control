@@ -13,10 +13,20 @@
   "keywords": [
     "electron",
     "webhid",
+    "hid",
     "rgb",
+    "rgb-keyboard",
     "keyboard",
+    "keyboard-backlight",
+    "keyboard-lighting",
+    "mechanical-keyboard",
     "portronics",
-    "hydra-10"
+    "hydra-10",
+    "sinowealth",
+    "sino-wealth",
+    "lighting-effects",
+    "lighting-control",
+    "windows"
   ],
   "scripts": {
     "start": "electron .",
