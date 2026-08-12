@@ -5,6 +5,8 @@ A desktop RGB control console for the [Portronics Hydra 10](https://www.portroni
 Electron and WebHID, it streams lighting frames to the board in real time at
 ~30fps and renders a live 3D preview of the current effect.
 
+![Arc Console screenshot](docs/screenshot.png)
+
 ## Features
 
 - **8 lighting effects** — Off, Solid, Breathing, Spectrum Cycle, Rainbow,
