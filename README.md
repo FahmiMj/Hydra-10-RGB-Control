@@ -32,6 +32,8 @@ Electron and WebHID, it streams lighting frames to the board in real time at
 
 ## Requirements
 
+- **The keyboard must be in wired mode** — WebHID cannot see the Hydra 10
+  over Bluetooth or the 2.4GHz dongle; plug it in via USB.
 - Windows 10/11 (target platform)
 - Google Chrome, Microsoft Edge, or Brave — Chromium-based browsers only,
   as WebHID is not supported in Firefox or Safari.
@@ -42,7 +44,9 @@ Electron and WebHID, it streams lighting frames to the board in real time at
 
 1. Download the latest installer or portable build from the
    [Releases](../../releases) page.
-2. Launch **Arc Console** and click **Connect keyboard**.
+2. **Plug the keyboard in with the USB cable (wired mode)** — wireless
+   (Bluetooth/2.4GHz) connections are not supported by WebHID.
+3. Launch **Arc Console** and click **Connect keyboard**.
 3. Choose the Hydra 10 in the device picker (only the Hydra 10 is ever
    offered or accepted).
 4. Pick an effect, adjust color/brightness/speed, and paint individual keys
@@ -79,6 +83,9 @@ npm run dist:win    # produces NSIS installer + portable exe in release/
 
 - **"WebHID not supported"** — use a Chromium-based browser or the packaged
   app; WebHID requires a secure context.
+- **Keyboard doesn't appear / no device found** — make sure the keyboard is
+  in **wired mode** (USB) — it can't be detected over Bluetooth or the
+  2.4GHz wireless dongle.
 - **Keyboard doesn't light up** — confirm your board is the Portronics
   Hydra 10 (VID `0x258A`, PID `0x010C`) and try the test report buttons in
   the Diagnostics panel.
