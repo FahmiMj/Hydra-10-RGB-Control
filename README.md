@@ -5,6 +5,10 @@ A desktop RGB control console for the [Portronics Hydra 10](https://www.portroni
 Electron and WebHID, it streams lighting frames to the board in real time at
 ~30fps and renders a live 3D preview of the current effect.
 
+Wired USB is fully supported. **2.4 GHz dongle support is experimental** and
+depends on the receiver exposing the same vendor RGB report channel as the
+wired board.
+
 ![Arc Console screenshot](docs/screenshot.png)
 
 > **Try it in your browser** — no install needed: open the
@@ -32,8 +36,10 @@ Electron and WebHID, it streams lighting frames to the board in real time at
 
 ## Requirements
 
-- **The keyboard must be in wired mode** — WebHID cannot see the Hydra 10
-  over Bluetooth or the 2.4GHz dongle; plug it in via USB.
+- **Wired USB is the supported transport.** 2.4 GHz dongle support is
+  experimental and only works if the receiver advertises feature report #6
+  (519 bytes) or output report #0 (520 bytes) on a vendor page (`0xFF00`).
+  WebHID cannot see the keyboard over Bluetooth.
 - Windows 10/11 (target platform)
 - Google Chrome, Microsoft Edge, or Brave — Chromium-based browsers only,
   as WebHID is not supported in Firefox or Safari.
@@ -44,16 +50,36 @@ Electron and WebHID, it streams lighting frames to the board in real time at
 
 1. Download the latest installer or portable build from the
    [Releases](../../releases) page.
-2. **Plug the keyboard in with the USB cable (wired mode)** — wireless
-   (Bluetooth/2.4GHz) connections are not supported by WebHID.
+2. **Plug the keyboard in with the USB cable (wired mode)**, or insert the
+   2.4 GHz receiver and switch the board to wireless mode.
 3. Launch **Arc Console** and click **Connect keyboard**.
-3. Choose the Hydra 10 in the device picker (only the Hydra 10 is ever
-   offered or accepted).
+3. Choose the Hydra 10 (or its receiver) in the device picker.
 4. Pick an effect, adjust color/brightness/speed, and paint individual keys
    directly on the 3D keyboard.
 
-If multiple Hydra 10 units are connected, a menu lets you select which one
-to control. Any non-Hydra HID device is always ignored.
+If multiple devices are connected, a menu lets you select which one to
+control. Any non-Hydra HID device is always ignored.
+
+### Experimental: 2.4 GHz dongle
+
+The receiver is a **separate USB device** with its own VID/PID and report
+map, so it must be identified before anything is written to it.
+
+1. Open **Diagnostics → Inspect HID devices (read-only)**.
+2. Insert the dongle (and switch the keyboard to 2.4 GHz mode), then
+   **Scan again / add device**. Note the receiver's VID/PID and whether it
+   exposes `feature #6` (roughly 519 bytes) or `output #0` (roughly 520 bytes)
+   on usage page `0xFF00`.
+3. In Diagnostics, tick **Dongle mode**, enter the receiver PID (hex), and
+   connect.
+4. Only after confirming the report channel, tick **Allow RGB writes over
+   2.4 GHz**. Writes stay blocked until then, and the stream is capped at
+   20 fps on the wireless link.
+
+If the receiver only exposes a boot keyboard collection (no vendor page),
+the 2.4 GHz link simply does not tunnel lighting and this project cannot
+control it. Do **not** force other report IDs — that risks writing into the
+keyboard's config zone.
 
 ## Development
 
@@ -83,12 +109,13 @@ npm run dist:win    # produces NSIS installer + portable exe in release/
 
 - **"WebHID not supported"** — use a Chromium-based browser or the packaged
   app; WebHID requires a secure context.
-- **Keyboard doesn't appear / no device found** — make sure the keyboard is
-  in **wired mode** (USB) — it can't be detected over Bluetooth or the
-  2.4GHz wireless dongle.
+- **Keyboard doesn't appear / no device found** — use a Chromium-based
+  browser or the packaged app; WebHID requires a secure context. For the
+  2.4 GHz receiver, run the read-only HID inspector and enter its PID.
 - **Keyboard doesn't light up** — confirm your board is the Portronics
-  Hydra 10 (VID `0x258A`, PID `0x010C`) and try the test report buttons in
-  the Diagnostics panel.
+  Hydra 10 (wired VID `0x258A`, PID `0x010C`) and try the test report buttons
+  in the Diagnostics panel. Over 2.4 GHz, check that the receiver exposes
+  the vendor RGB report channel first.
 - **Preview works but board is dark** — check that the status pill shows
   `Linked`; if the strategy was auto-negotiated as an output report, the
   diagnostics panel will show which report is in use.
