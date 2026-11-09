@@ -386,37 +386,54 @@ const RGB = (() => {
         }
       }
 
-      // The keyboard exposes multiple HID interfaces. Report 6 (the RGB
-      // bulk-channel) lives ONLY on the vendor interface (usage page
-      // 0xFF00). The boot-keyboard interface can silently accept-and-pad a
-      // feature write, so probe vendor-interface devices FIRST and pick the
-      // first one that both accepts the write AND echoes it back.
+      // The keyboard exposes multiple HID interfaces. Only the vendor page
+      // (0xFF00) carries the RGB bulk channel. Never probe keyboard/boot
+      // interfaces: some accept feature writes and silently misinterpret
+      // them, which is how config zones get trashed.
       const vendorDevices = devices.filter(isVendorDevice);
-      const ordered = [...vendorDevices, ...devices.filter((d) => !vendorDevices.includes(d))];
+      if (!vendorDevices.length) {
+        setStatus('error', transport.dongle
+          ? 'Dongle exposes no vendor RGB interface'
+          : 'No vendor RGB interface found');
+        log(`No vendor-page (0xFF00) interface found. ${devices.map((d) => summarizeCollections(d.collections)).join(' | ')}`, 'error');
+        log('If this is the 2.4GHz receiver, its report map may not carry keyboard lighting at all.', 'warn');
+        return false;
+      }
 
       let picked = null;
-      for (const d of ordered) {
+      for (const d of vendorDevices) {
         device = d;
         try {
           if (!device.opened) await device.open();
         } catch (e) {
           continue;
         }
-        const isVendor = isVendorDevice(d);
-        log(`Probing ${device.productName || 'device'}${isVendor ? ' [VENDOR]' : ' [non-vendor]'}: ${summarizeCollections(device.collections)}`);
-        if (await detectReportStrategy()) {
-          // The board's RGB bulk-channel only exists on a vendor-page (0xFF00)
-          // interface, and after a SET it echoes the command header back on
-          // GET. A keyboard-only interface may accept feature writes but
-          // ignore them (Windows), so: only accept an interface that is
-          // vendor-page, OR that positively echoes the header.
-          const echoed = await verifyEcho();
-          if (echoed === true || isVendor) {
-            picked = d;
-            break;
-          }
-          log('Write accepted but interface is not vendor RGB — trying next interface', 'warn');
+        const mode = transportMode(d);
+        log(`Probing ${device.productName || 'device'} [${mode.toUpperCase()}]: ${summarizeCollections(device.collections)}`);
+
+        if (!hasRgbReportChannel(d)) {
+          log('No RGB report channel (feature #6 / output #0) advertised — skipping, no blind writes', 'warn');
+          try { await d.close(); } catch (e) {}
+          continue;
         }
+
+        if (mode === 'dongle' && !dongleWritesConfirmed) {
+          setStatus('error', 'Dongle is read-only until writes are allowed');
+          log('Refusing to write RGB frames over 2.4GHz. Inspect the dongle first, then tick "Allow RGB writes" in Diagnostics.', 'warn');
+          try { await d.close(); } catch (e) {}
+          device = null;
+          return false;
+        }
+
+        if (await detectReportStrategy()) {
+          // A vendor-page interface is authoritative. The readback echo is a
+          // bonus signal, not a requirement (some receivers cannot echo).
+          await verifyEcho();
+          picked = d;
+          break;
+        }
+        log('Device rejected the advertised RGB reports — trying next vendor interface', 'warn');
+        try { await d.close(); } catch (e) {}
       }
 
       if (!picked) {
@@ -429,11 +446,13 @@ const RGB = (() => {
         if (d !== picked) { try { await d.close(); } catch (e) {} }
       }
 
+      const pickedMode = transportMode(picked);
+      sendIntervalMs = pickedMode === 'dongle' ? 50 : 0; // 20fps cap on 2.4GHz
       device.addEventListener('inputreport', onInputReport);
       bindVisibility();
       startStreaming();
-      setStatus('connected', { name: device.productName, strategy: reportStrategy });
-      log(`Streaming via ${reportStrategy.kind} report #${reportStrategy.reportId} (${reportStrategy.size}B)`);
+      setStatus('connected', { name: device.productName, strategy: reportStrategy, mode: pickedMode });
+      log(`Streaming via ${reportStrategy.kind} report #${reportStrategy.reportId} (${reportStrategy.size}B) in ${pickedMode} mode${sendIntervalMs ? ` at <=${1000 / sendIntervalMs}fps` : ''}`);
       return true;
     } catch (err) {
       const detail = {
@@ -449,55 +468,55 @@ const RGB = (() => {
   }
 
   async function detectReportStrategy(forced) {
-    if (forced) {
-      reportStrategy = forced;
-      const testBuf = new Uint8Array(forced.size);
-      const ok = await tryWrite(forced, testBuf);
-      return ok;
-    }
+    if (!device) return false;
 
-    // Known-working report formats for this board, probed in deterministic
-    // order (the original verified plugin's order):
-    //   1. Feature report #6  — 519-byte feature report, 7-byte header.
-    //   2. Output report #0   — 520-byte interrupt OUT, 8-byte header.
-    const proven = [
-      { kind: 'feature', reportId: DEFAULT_REPORT_ID, size: REPORT_SIZE },
-      { kind: 'output', reportId: 0, size: REPORT_SIZE + 1 },
-    ];
-    for (const cand of proven) {
-      const testBuf = new Uint8Array(cand.size);
-      testBuf.set(HEADER, 0);
-      const ok = await tryWrite(cand, testBuf);
-      if (ok) {
-        reportStrategy = cand;
-        log(`Using ${cand.kind} report #${cand.reportId} (${cand.size}B)`);
-        return true;
-      }
-    }
-
-    // Last-resort: scan whatever reports the HID collection advertises.
+    // Only ever use the two verified RGB channels, and only when the device's
+    // own report descriptor advertises them. There is deliberately NO fallback
+    // scan over other report IDs: writing 519 bytes into an unknown vendor
+    // report can corrupt the board's config zone.
     const candidates = [];
-    for (const col of device.collections) {
-      const reportIds = new Set();
-      (col.featureReports || []).forEach((r) => reportIds.add(r.reportId));
-      (col.outputReports || []).forEach((r) => reportIds.add(r.reportId));
-      reportIds.add(DEFAULT_REPORT_ID);
-      for (const id of reportIds) {
-        candidates.push({ kind: 'feature', reportId: id, size: REPORT_SIZE });
-        candidates.push({ kind: 'output', reportId: id, size: REPORT_SIZE });
+    if (forced) {
+      const validForced =
+        (forced.kind === 'feature' && forced.reportId === DEFAULT_REPORT_ID && forced.size === REPORT_SIZE) ||
+        (forced.kind === 'output' && forced.reportId === 0 && forced.size === REPORT_SIZE + 1);
+      if (!validForced) {
+        log('Refusing unknown report strategy — only feature #6 (519B) and output #0 (520B) are allowed', 'error');
+        return false;
+      }
+      candidates.push(forced);
+    } else {
+      if (findReport(device, 'feature', DEFAULT_REPORT_ID)) {
+        candidates.push({ kind: 'feature', reportId: DEFAULT_REPORT_ID, size: REPORT_SIZE });
+      }
+      if (findReport(device, 'output', 0)) {
+        candidates.push({ kind: 'output', reportId: 0, size: REPORT_SIZE + 1 });
       }
     }
-    candidates.sort((a, b) => (a.reportId === DEFAULT_REPORT_ID ? -1 : 1) - (b.reportId === DEFAULT_REPORT_ID ? -1 : 1));
+
+    if (!candidates.length) {
+      log('Device advertises neither feature #6 nor output #0 — not an RGB channel', 'error');
+      return false;
+    }
 
     for (const cand of candidates) {
+      // Read-only fingerprint first: proves the channel exists without
+      // writing anything. A write is only attempted on an advertised channel.
+      if (cand.kind === 'feature') {
+        try {
+          const view = await device.receiveFeatureReport(DEFAULT_REPORT_ID);
+          log(`Feature #6 readable (${view.byteLength}B)`, 'debug');
+        } catch (e) {
+          log('Feature #6 is write-only on this interface — relying on its descriptor', 'debug');
+        }
+      }
       const testBuf = new Uint8Array(cand.size);
       testBuf.set(HEADER, 0);
-      const ok = await tryWrite(cand, testBuf);
-      if (ok) {
+      if (await tryWrite(cand, testBuf)) {
         reportStrategy = cand;
         log(`Using ${cand.kind} report #${cand.reportId} (${cand.size}B)`);
         return true;
       }
+      log(`${cand.kind} report #${cand.reportId} rejected`, 'debug');
     }
     return false;
   }
@@ -639,6 +658,8 @@ const RGB = (() => {
     // still in flight (async write outstanding), drop this one and let the
     // next rAF tick carry the latest frame data instead.
     if (!device || !device.opened || !reportStrategy || isSending) return;
+    // 2.4GHz links cannot absorb 30-60 frames/sec of 519-byte vendor traffic.
+    if (sendIntervalMs && performance.now() - lastFrameTime < sendIntervalMs) return;
     isSending = true;
     const buf = buildPacket(perLed);
     const ok = await tryWrite(reportStrategy, buf);
@@ -647,6 +668,7 @@ const RGB = (() => {
     // Only re-detect after repeated failures, not on every rejection —
     // a single hiccup should not tear down the working stream.
     if (ok) {
+      lastFrameTime = performance.now();
       consecutiveFailures = 0;
       return;
     }
@@ -659,9 +681,24 @@ const RGB = (() => {
   }
 
   async function sendTestReport(overrideSize, overrideReportId) {
-    const size = overrideSize || (reportStrategy ? reportStrategy.size : REPORT_SIZE);
-    const reportId = overrideReportId != null ? overrideReportId : (reportStrategy ? reportStrategy.reportId : DEFAULT_REPORT_ID);
-    const strategy = { kind: reportStrategy ? reportStrategy.kind : 'feature', reportId, size };
+    if (!device || !reportStrategy) {
+      log('Connect first — refusing to write a test report to an unverified channel', 'warn');
+      return false;
+    }
+    const size = overrideSize || reportStrategy.size;
+    const reportId = overrideReportId != null ? overrideReportId : reportStrategy.reportId;
+    const allowed =
+      (reportStrategy.kind === 'feature' && reportId === DEFAULT_REPORT_ID && size === REPORT_SIZE) ||
+      (reportStrategy.kind === 'output' && reportId === 0 && size === REPORT_SIZE + 1);
+    if (!allowed) {
+      log(`Refusing test write to ${reportStrategy.kind} #${reportId} @ ${size}B — only the verified RGB channel is allowed`, 'error');
+      return false;
+    }
+    if (transportMode(device) === 'dongle' && !dongleWritesConfirmed) {
+      log('Refusing test write over 2.4GHz — allow writes in Diagnostics first', 'warn');
+      return false;
+    }
+    const strategy = { kind: reportStrategy.kind, reportId, size };
     const buf = new Uint8Array(size);
     buf.set(HEADER.slice(0, Math.min(HEADER.length, size)), 0);
     const ok = await tryWrite(strategy, buf);
@@ -687,17 +724,24 @@ const RGB = (() => {
     reconnectTimer = setTimeout(async () => {
       if (!navigator.hid) return;
       const known = await navigator.hid.getDevices();
-      const match = known.find((d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID);
+      const match = known.find(isHydra);
       if (match) {
         device = match;
         try {
           if (!device.opened) await device.open();
+          const mode = transportMode(device);
+          if (mode === 'dongle' && !dongleWritesConfirmed) {
+            device = null;
+            scheduleReconnect();
+            return;
+          }
           const ok = await detectReportStrategy();
           if (ok) {
+            sendIntervalMs = mode === 'dongle' ? 50 : 0;
             device.addEventListener('inputreport', onInputReport);
             startStreaming();
-            setStatus('connected', { name: device.productName, strategy: reportStrategy });
-            log('Auto-reconnected');
+            setStatus('connected', { name: device.productName, strategy: reportStrategy, mode });
+            log(`Auto-reconnected in ${mode} mode`);
             return;
           }
         } catch (e) { /* fall through to retry */ }
@@ -831,17 +875,50 @@ const RGB = (() => {
   }
 
   function forceReportStrategy(kind, reportId, size) {
-    detectReportStrategy({ kind, reportId, size: size || REPORT_SIZE });
+    if (!device) {
+      log('Connect first — no device to switch reports on', 'warn');
+      return;
+    }
+    const defaultSize = reportId === 0 ? REPORT_SIZE + 1 : REPORT_SIZE;
+    detectReportStrategy({ kind, reportId, size: size || defaultSize });
+  }
+
+  // ---------------------------------------------------------------------
+  // 2.4GHz dongle controls (opt-in; see transport block at the top)
+  // ---------------------------------------------------------------------
+  function setDongleMode(enabled, pid, allowWrites) {
+    const nextPid = Number.isFinite(pid) && pid > 0 ? pid : null;
+    transport = { dongle: !!enabled, pid: nextPid };
+    dongleWritesConfirmed = !!(enabled && allowWrites);
+    try {
+      localStorage.setItem('rgb-dongle-enabled', transport.dongle ? '1' : '0');
+      localStorage.setItem('rgb-dongle-pid', nextPid ? nextPid.toString(16).padStart(4, '0') : '');
+    } catch (e) { /* storage unavailable, non-fatal */ }
+    log(
+      `Dongle mode ${transport.dongle ? 'enabled' : 'disabled'}` +
+      (nextPid ? ` (PID 0x${nextPid.toString(16).toUpperCase()})` : '') +
+      `, RGB writes ${dongleWritesConfirmed ? 'ALLOWED' : 'blocked'}`,
+      transport.dongle && dongleWritesConfirmed ? 'warn' : 'info'
+    );
+  }
+
+  function getDongleMode() {
+    return { enabled: transport.dongle, pid: transport.pid, allowWrites: dongleWritesConfirmed };
+  }
+
+  function getMode() {
+    return device ? transportMode(device) : null;
   }
 
   return {
-    VENDOR_ID, PRODUCT_ID, DEFAULT_REPORT_ID, REPORT_SIZE, LED_COUNT, SPECTRUM,
+    VENDOR_ID, PRODUCT_ID, DONGLE_PIDS, DEFAULT_REPORT_ID, REPORT_SIZE, LED_COUNT, SPECTRUM,
     LED_LAYOUT, KEY_LAYOUT, LAYOUT_TOTAL_W, LAYOUT_ROWS,
     connect, disconnect, sendTestReport,
     setEffect, setColor, setBrightness, setSpeed, setPerKeyColor, clearPerKey,
     getState, onStatus, onFrame, onLog, onFps,
     onPickDevice,
     listReportOptions, forceReportStrategy,
+    setDongleMode, getDongleMode, getMode,
     effectNames: Object.keys(EFFECTS),
     hexToRgb, rgbToHex,
   };
