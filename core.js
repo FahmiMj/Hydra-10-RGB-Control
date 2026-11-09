@@ -358,12 +358,17 @@ const RGB = (() => {
       // in case the browser's picker ever ignores the requestDevice() filter.
       devices = devices.filter(isHydra);
       if (!devices.length) {
-        devices = (await navigator.hid.requestDevice({
-          filters: deviceFilters(),
-        })).filter(isHydra);
+        const raw = await navigator.hid.requestDevice({ filters: deviceFilters() });
+        devices = raw.filter(isHydra);
         log(`requestDevice(): ${devices.length} supported device(s) returned`);
+        if (raw.length && !devices.length) {
+          log(`Picker returned ${raw.map((d) => `0x${d.vendorId.toString(16)}:0x${d.productId.toString(16)}`).join(', ')} — none matched a supported ID`, 'warn');
+        }
       }
       if (!devices.length) {
+        if (transport.dongle && !transport.pid) {
+          log('Dongle mode is on but no receiver PID is set. Use "Inspect HID devices", enter the dongle PID, then connect.', 'warn');
+        }
         setStatus('idle');
         return false;
       }

@@ -526,7 +526,7 @@
   }
 
   function formatDeviceList(devices) {
-    if (!devices.length) return 'No SinoWealth (VID 0x258A) HID devices found.';
+    if (!devices.length) return 'No HID devices found.';
     return devices.map((d, i) => {
       const lines = [];
       lines.push(`#${i + 1}  ${d.productName || '(unnamed HID device)'}`);
@@ -560,14 +560,14 @@
     }
     let devices = [];
     try {
-      devices = (await navigator.hid.getDevices()).filter((d) => d.vendorId === RGB.VENDOR_ID);
+      devices = await navigator.hid.getDevices();
     } catch (e) { /* fall through to picker */ }
 
     if (!devices.length) {
       try {
-        devices = (await navigator.hid.requestDevice({
-          filters: [{ vendorId: RGB.VENDOR_ID }],
-        })).filter((d) => d.vendorId === RGB.VENDOR_ID);
+        // Empty filters: show every HID device so a receiver with an unknown
+        // VID/PID can still be identified. This path is read-only.
+        devices = await navigator.hid.requestDevice({ filters: [] });
       } catch (e) {
         console.warn(`HID inspection cancelled: ${e}`);
         return;
@@ -594,7 +594,7 @@
 
     const sub = document.createElement('p');
     sub.className = 'device-picker-sub';
-    sub.textContent = 'Nothing is written here. Plug in whichever transport you want to inspect (wired cable or 2.4GHz dongle), then scan.';
+    sub.textContent = 'Read-only. Plug in the wired cable or the 2.4GHz dongle, then scan. All HID devices are listed so a receiver with a different VID/PID can be identified.';
 
     const pre = document.createElement('pre');
     pre.style.cssText = 'max-height:48vh;overflow:auto;white-space:pre-wrap;text-align:left;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:12px;margin:12px 0;color:#dbe7ff;';
@@ -614,9 +614,7 @@
 
     const scanBtn = makeBtn('Scan again / add device', 'btn-outline', async () => {
       try {
-        const picked = (await navigator.hid.requestDevice({
-          filters: [{ vendorId: RGB.VENDOR_ID }],
-        })).filter((d) => d.vendorId === RGB.VENDOR_ID);
+        const picked = await navigator.hid.requestDevice({ filters: [] });
         const merged = [...devices];
         picked.forEach((d) => { if (!merged.includes(d)) merged.push(d); });
         devices = merged;
