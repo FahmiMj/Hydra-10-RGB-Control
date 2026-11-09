@@ -21,7 +21,11 @@ const RGB = (() => {
   // Protocol constants
   // ---------------------------------------------------------------------
   const VENDOR_ID = 0x258A;
-  const PRODUCT_ID = 0x010C;
+  const PRODUCT_ID = 0x010C; // wired USB build
+  // 2.4GHz receivers are separate USB devices and may use a different PID.
+  // Populate this only after inspecting a real dongle (PIDs are added here
+  // once verified; the UI also accepts a PID explicit per session).
+  const DONGLE_PIDS = [];
 
   const DEFAULT_REPORT_ID = 6;
   const REPORT_SIZE = 519; // total payload length, including RGB data + padding
@@ -139,7 +143,27 @@ const RGB = (() => {
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 5;
 
+  // 2.4GHz support is opt-in. The receiver's report map is NOT guaranteed to
+  // match the wired board's, so RGB writes stay blocked until the user has
+  // inspected the dongle and explicitly allowed them for this session.
+  let transport = loadTransport();
+  let dongleWritesConfirmed = false;
+  let sendIntervalMs = 0; // dongle links get throttled; wired stays unthrottled
+
   const state = loadState();
+
+  function loadTransport() {
+    const fallback = { dongle: false, pid: null };
+    try {
+      const pid = parseInt(localStorage.getItem('rgb-dongle-pid') || '', 16);
+      return {
+        dongle: localStorage.getItem('rgb-dongle-enabled') === '1',
+        pid: Number.isFinite(pid) && pid > 0 ? pid : null,
+      };
+    } catch (e) {
+      return fallback;
+    }
+  }
 
   function loadState() {
     const fallback = {
@@ -328,16 +352,16 @@ const RGB = (() => {
         log(`getDevices failed: ${e}`, 'warn');
       }
 
-      // NEVER probe, link to, or auto-grant anything but the Hydra 10. Every
-      // path back into the probe loop below is hard-filtered on VID/PID —
-      // including the device-chooser result, which is re-checked in case the
-      // browser's picker ever ignores the requestDevice() filter.
+      // NEVER probe, link to, or auto-grant anything but supported Hydra
+      // hardware. Every path back into the probe loop below is hard-filtered
+      // on VID/PID — including the device-chooser result, which is re-checked
+      // in case the browser's picker ever ignores the requestDevice() filter.
       devices = devices.filter(isHydra);
       if (!devices.length) {
         devices = (await navigator.hid.requestDevice({
-          filters: [{ vendorId: VENDOR_ID, productId: PRODUCT_ID }],
+          filters: deviceFilters(),
         })).filter(isHydra);
-        log(`requestDevice(): ${devices.length} Hydra device(s) returned`);
+        log(`requestDevice(): ${devices.length} supported device(s) returned`);
       }
       if (!devices.length) {
         setStatus('idle');
@@ -500,10 +524,33 @@ const RGB = (() => {
     }
   }
 
-  // Strict identity check for the supported board. Every device list that can
-  // reach the connect/probe path passes through this first.
+  // Strict identity check for supported Hydra hardware. The wired board is
+  // always accepted; a dongle is accepted only once its PID has been verified
+  // (built-in list) or entered explicitly in the Diagnostics panel.
+  function supportedPid(d) {
+    if (!d) return null;
+    if (d.productId === PRODUCT_ID) return 'wired';
+    if (transport.pid && d.productId === transport.pid) return 'dongle';
+    if (DONGLE_PIDS.includes(d.productId)) return 'dongle';
+    return null;
+  }
+
   function isHydra(d) {
-    return d && d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID;
+    return !!(d && d.vendorId === VENDOR_ID && supportedPid(d));
+  }
+
+  function transportMode(d) {
+    return d && d.productId !== PRODUCT_ID ? 'dongle' : 'wired';
+  }
+
+  // requestDevice() can only be filtered by VID/PID, so build the filter from
+  // the known IDs. If dongle mode is on but no PID is set yet, widen to the
+  // vendor ID only so the user can see what the receiver reports.
+  function deviceFilters() {
+    if (transport.dongle && !transport.pid) return [{ vendorId: VENDOR_ID }];
+    const pids = new Set([PRODUCT_ID, ...DONGLE_PIDS]);
+    if (transport.pid) pids.add(transport.pid);
+    return Array.from(pids, (productId) => ({ vendorId: VENDOR_ID, productId }));
   }
 
   // The board's RGB bulk-channel (report 6) exists only on collections with
@@ -511,6 +558,39 @@ const RGB = (() => {
   function isVendorDevice(d) {
     return (d.collections || []).some(
       (c) => c.usagePage === 0xff00 || (c.featureReports || []).some((r) => r.reportId === DEFAULT_REPORT_ID)
+    );
+  }
+
+  function findReport(d, kind, reportId) {
+    for (const col of d.collections || []) {
+      const list = kind === 'feature' ? col.featureReports : col.outputReports;
+      const hit = (list || []).find((r) => r.reportId === reportId);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  // HIDReportInfo reports its payload as reportSize * reportCount bits.
+  function reportBytes(report) {
+    const bits = (report.items || []).reduce(
+      (n, it) => n + (it.reportSize || 0) * (it.reportCount || 0),
+      0
+    );
+    return Math.ceil(bits / 8);
+  }
+
+  // Only treat a device as an RGB target when its descriptors actually
+  // advertise the 519-byte feature channel or the 520-byte output channel.
+  // This is what prevents writing a 519-byte frame into some other vendor
+  // report on a receiver whose report map we have not verified.
+  function hasRgbReportChannel(d) {
+    const f6 = findReport(d, 'feature', DEFAULT_REPORT_ID);
+    const o0 = findReport(d, 'output', 0);
+    const f6bytes = f6 ? reportBytes(f6) : 0;
+    const o0bytes = o0 ? reportBytes(o0) : 0;
+    return !!(
+      (f6 && (f6bytes === 0 || f6bytes >= REPORT_SIZE - 8)) ||
+      (o0 && (o0bytes === 0 || o0bytes >= REPORT_SIZE))
     );
   }
 
