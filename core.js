@@ -369,8 +369,9 @@ const RGB = (() => {
     const [h, s, v] = rgbToHsv(rgb[0], rgb[1], rgb[2]);
     if (v < 0.04) return [0, 0, 0];
     const hq = hSteps <= 1 ? 0 : (Math.round((h / 360) * hSteps) % hSteps);
-    const sq = sSteps <= 1 ? 1 : Math.max(1 / (sSteps - 1), Math.round(s * (sSteps - 1)) / (sSteps - 1));
-    const vq = vSteps <= 1 ? 1 : Math.max(1 / (vSteps - 1), Math.round(v * (vSteps - 1)) / (vSteps - 1));
+    const sq = sSteps <= 1 ? s : Math.round(s * (sSteps - 1)) / (sSteps - 1);
+    // Floor non-black colours to one value step so dim effects don't vanish.
+    const vq = vSteps <= 1 ? v : Math.max(1 / (vSteps - 1), Math.round(v * (vSteps - 1)) / (vSteps - 1));
     return hsvToRgb((hq / hSteps) * 360, sq, vq);
   }
 
@@ -505,6 +506,12 @@ const RGB = (() => {
         }
         setStatus('idle');
         return false;
+      }
+
+      // If dongle mode was requested but only the wired board is present, say
+      // so plainly instead of silently switching transport.
+      if (transport.dongle && devices.every((d) => transportMode(d) === 'wired')) {
+        log('Dongle mode is on, but only the wired keyboard (0x258A:0x010C) is attached. Connect the 2.4GHz receiver, or unplug the cable and switch the board to 2.4GHz mode.', 'warn');
       }
 
       // More than one Hydra 10 attached: hand them to the UI for selection
@@ -732,10 +739,13 @@ const RGB = (() => {
   function transportMode(d) {
     if (!d) return 'wired';
     if (d.vendorId === DONGLE_VID && d.productId === DONGLE_PID) return 'dongle';
-    // Explicit dongle mode always wins: if a receiver reuses the wired
-    // PID, the write gate and wireless pacing must still apply.
+    // The wired board is a known, distinct VID/PID. If it is attached, treat
+    // it as wired even when dongle mode was left enabled — otherwise the
+    // dongle detector would look for output report 0x13 on a board that does
+    // not have it and falsely report the link as unsupported.
+    if (d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID) return 'wired';
+    // Any other explicitly-enabled manual VID/PID is treated as a receiver.
     if (transport.dongle) return 'dongle';
-    if (d.vendorId !== VENDOR_ID || d.productId !== PRODUCT_ID) return 'dongle';
     const name = String(d.productName || '').toLowerCase();
     if (/receiver|dongle|2\.4\s*ghz|wireless/.test(name)) return 'dongle';
     return 'wired';
@@ -847,6 +857,12 @@ const RGB = (() => {
   // produced by buildDongleChunks(); the config command is unreachable here.
   async function sendDongleFrame(perLed, force) {
     if (!device || !device.opened || !reportStrategy) return false;
+    // Live re-check: toggling "Allow RGB writes" off mid-stream must stop the
+    // very next frame, not just the next reconnect.
+    if (!dongleWritesConfirmed) {
+      log('Dongle writes are blocked — tick "Allow RGB writes" in Diagnostics to resume', 'warn');
+      return false;
+    }
     const chunks = buildDongleChunks(perLed);
     if (!chunks.length) return false;
     const now = performance.now();
@@ -1133,10 +1149,19 @@ const RGB = (() => {
       log('Connect first — no device to switch reports on', 'warn');
       return;
     }
-    const defaultSize = kind === 'dongle'
-      ? DONGLE_REPORT_SIZE
-      : (reportId === 0 ? REPORT_SIZE + 1 : REPORT_SIZE);
-    detectReportStrategy({ kind, reportId, size: size || defaultSize });
+    // Normalise: the dongle lighting channel is output report 0x13. Accept it
+    // under either name so the Diagnostics dropdown keeps working.
+    let nextKind = kind;
+    let nextId = reportId;
+    let defaultSize = REPORT_SIZE;
+    if (reportId === DONGLE_REPORT_ID) {
+      nextKind = 'dongle';
+      nextId = DONGLE_REPORT_ID;
+      defaultSize = DONGLE_REPORT_SIZE;
+    } else if (reportId === 0) {
+      defaultSize = REPORT_SIZE + 1;
+    }
+    detectReportStrategy({ kind: nextKind, reportId: nextId, size: size || defaultSize });
   }
 
   // ---------------------------------------------------------------------
