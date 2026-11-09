@@ -514,6 +514,15 @@ const RGB = (() => {
         log('Dongle mode is on, but only the wired keyboard (0x258A:0x010C) is attached. Connect the 2.4GHz receiver, or unplug the cable and switch the board to 2.4GHz mode.', 'warn');
       }
 
+      // A single physical keyboard exposes several HID interfaces (boot
+      // keyboard, mouse, consumer, vendor). Only interfaces that advertise a
+      // verified RGB channel can ever be driven, so drop the rest before the
+      // multi-device picker. Without this, the 2.4GHz receiver shows up twice
+      // under the same name and the user can pick the dead keyboard interface.
+      const rgbCapable = devices.filter(hasRgbReportChannel);
+      if (rgbCapable.length) devices = rgbCapable;
+      log(`Interfaces with a verified RGB channel: ${devices.length}`);
+
       // More than one Hydra 10 attached: hand them to the UI for selection
       // instead of silently grabbing the first unit. Falls back to the first
       // (with a warning) if no picker handler is wired up.
