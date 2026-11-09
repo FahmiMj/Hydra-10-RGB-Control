@@ -464,6 +464,11 @@ a{ color:inherit; }
   background: rgba(255,255,255,.03); border:1px solid var(--border); border-radius: var(--radius-sm);
   padding:8px 10px; color: var(--text); font-family: var(--font-mono); font-size:12px;
 }
+.debug-field input[type="checkbox"]{ width:18px; height:18px; padding:0; accent-color:#22d3ee; align-self:flex-start; }
+.debug-check{ flex-direction:row; align-items:center; gap:8px; margin:8px 0 4px; font-size:11px; color:var(--muted); letter-spacing:.03em; }
+.debug-check input{ width:18px; height:18px; margin:0; accent-color:#22d3ee; }
+.debug-note{ font-size:10.5px; line-height:1.45; color:var(--muted); margin:0 0 10px; }
+#inspect-btn{ margin-bottom:8px; }
 .debug-readout{ margin:14px 0 0; font-size:12px; }
 .debug-readout div{ display:flex; justify-content:space-between; padding:6px 0; border-top:1px solid var(--border-soft); }
 .debug-readout dt{ color: var(--muted); font-weight:500; }

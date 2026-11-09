@@ -153,10 +153,28 @@
           </label>
         </div>
 
+        <div class="debug-grid">
+          <label class="debug-field">
+            <span>Dongle mode</span>
+            <input type="checkbox" id="dongle-toggle" />
+          </label>
+          <label class="debug-field">
+            <span>Dongle PID (hex)</span>
+            <input type="text" id="dongle-pid" maxlength="6" placeholder="010D" spellcheck="false" autocomplete="off" />
+          </label>
+        </div>
+        <label class="debug-field debug-check">
+          <input type="checkbox" id="dongle-writes" />
+          <span>Allow RGB writes over 2.4&nbsp;GHz</span>
+        </label>
+        <p class="debug-note">Only enable this after inspecting the receiver. Writes stay blocked until ticked; wired mode is unaffected.</p>
+
+        <button id="inspect-btn" class="btn btn-outline" type="button">Inspect HID devices (read-only)</button>
         <button id="send-test-btn" class="btn btn-outline" type="button">Send test report</button>
 
         <dl class="debug-readout">
           <div><dt>Device</dt><dd id="dd-device">—</dd></div>
+          <div><dt>Mode</dt><dd id="dd-mode">—</dd></div>
           <div><dt>Strategy</dt><dd id="dd-strategy">—</dd></div>
           <div><dt>LEDs mapped</dt><dd id="dd-leds">68 / 96</dd></div>
         </dl>

@@ -44,6 +44,7 @@
     buildKeyboard();
     bindControls();
     bindDebugPanel();
+    bindDongleControls();
     bindGimbalDrag();
     hydrateFromState();
 
@@ -320,6 +321,7 @@
       btn.dataset.connected = 'true';
       label.textContent = 'Disconnect';
       $('#dd-device').textContent = (detail && detail.name) || '—';
+      $('#dd-mode').textContent = detail && detail.mode ? detail.mode : '—';
       $('#dd-strategy').textContent = detail && detail.strategy
         ? `${detail.strategy.kind} #${detail.strategy.reportId} · ${detail.strategy.size}B` : '—';
       populateReportSelect();
@@ -328,6 +330,7 @@
       label.textContent = status === 'connecting' ? 'Connecting…' : 'Connect keyboard';
       if (status === 'idle' || status === 'error') {
         $('#dd-device').textContent = '—';
+        $('#dd-mode').textContent = '—';
         $('#dd-strategy').textContent = '—';
       }
     }
@@ -380,7 +383,7 @@
           `<span class="dp-badge">#${i + 1}</span>` +
           `<span class="dp-text">` +
             `<span class="dp-name">${escapeHtml(name)}</span>` +
-            `<span class="dp-meta">VID 0x${RGB.VENDOR_ID.toString(16).toUpperCase()} / PID 0x${RGB.PRODUCT_ID.toString(16).toUpperCase()}${escapeHtml(serial)}</span>` +
+            `<span class="dp-meta">VID 0x${d.vendorId.toString(16).toUpperCase()} / PID 0x${d.productId.toString(16).toUpperCase()}${escapeHtml(serial)}</span>` +
           `</span>`;
         b.addEventListener('click', () => {
           overlay.remove();
@@ -441,6 +444,8 @@
       RGB.sendTestReport(size, reportId);
     });
 
+    $('#inspect-btn').addEventListener('click', inspectHidDevices);
+
     $('#report-select').addEventListener('change', (e) => {
       const [kind, id] = e.target.value.split(':');
       if (!kind) return;
@@ -466,6 +471,219 @@
       o.textContent = `${kind} #${reportId}`;
       select.appendChild(o);
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // 2.4GHz dongle controls + read-only HID inspector
+  // ---------------------------------------------------------------------
+  function parseHexPid(value) {
+    const s = String(value || '').trim().replace(/^0x/i, '');
+    if (!/^[0-9a-f]{1,4}$/i.test(s)) return null;
+    return parseInt(s, 16);
+  }
+
+  function bindDongleControls() {
+    const toggle = $('#dongle-toggle');
+    const pidInput = $('#dongle-pid');
+    const writes = $('#dongle-writes');
+    if (!toggle || !pidInput || !writes) return;
+
+    const saved = RGB.getDongleMode();
+    toggle.checked = !!saved.enabled;
+    writes.checked = !!saved.allowWrites;
+    if (saved.pid) pidInput.value = saved.pid.toString(16).toUpperCase().padStart(4, '0');
+
+    const sync = () => {
+      if (!toggle.checked) writes.checked = false;
+      writes.disabled = !toggle.checked;
+      pidInput.disabled = !toggle.checked;
+      RGB.setDongleMode(toggle.checked, parseHexPid(pidInput.value), writes.checked);
+    };
+
+    toggle.addEventListener('change', sync);
+    pidInput.addEventListener('change', sync);
+    writes.addEventListener('change', () => {
+      if (writes.checked) {
+        const ok = confirm(
+          'Allow 519-byte RGB writes over the 2.4GHz receiver?\n\n' +
+          'Only continue if you have inspected the dongle and confirmed it exposes ' +
+          'feature report #6 (519B) or output report #0 (520B). Wrong writes to an ' +
+          'unverified vendor report can corrupt keyboard settings.'
+        );
+        if (!ok) { writes.checked = false; sync(); return; }
+      }
+      sync();
+    });
+
+    sync();
+  }
+
+  function reportSizeBytes(report) {
+    const bits = (report.items || []).reduce(
+      (n, it) => n + (it.reportSize || 0) * (it.reportCount || 0), 0
+    );
+    return Math.ceil(bits / 8);
+  }
+
+  function formatDeviceList(devices) {
+    if (!devices.length) return 'No SinoWealth (VID 0x258A) HID devices found.';
+    return devices.map((d, i) => {
+      const lines = [];
+      lines.push(`#${i + 1}  ${d.productName || '(unnamed HID device)'}`);
+      lines.push(`    VID 0x${d.vendorId.toString(16).toUpperCase().padStart(4, '0')}  PID 0x${d.productId.toString(16).toUpperCase().padStart(4, '0')}  serial ${d.serialNumber || '—'}`);
+      const cols = d.collections || [];
+      if (!cols.length) lines.push('    (no collections reported)');
+      cols.forEach((c, ci) => {
+        lines.push(`    collection ${ci}: usagePage=0x${(c.usagePage >>> 0).toString(16).toUpperCase()} usage=0x${(c.usage >>> 0).toString(16).toUpperCase()}`);
+        [['input', c.inputReports], ['output', c.outputReports], ['feature', c.featureReports]].forEach(([kind, list]) => {
+          (list || []).forEach((r) => {
+            const bytes = reportSizeBytes(r);
+            lines.push(`      ${kind} #${r.reportId}: ${bytes ? bytes + 'B' : 'size unknown'}`);
+          });
+        });
+      });
+      return lines.join('\n');
+    }).join('\n\n');
+  }
+
+  function hexPreview(bytes, max = 32) {
+    const n = Math.min(bytes.length, max);
+    let out = '';
+    for (let i = 0; i < n; i++) out += bytes[i].toString(16).padStart(2, '0') + ' ';
+    return out.trim() + (bytes.length > max ? ` … (${bytes.length}B total)` : '');
+  }
+
+  async function inspectHidDevices() {
+    if (!('hid' in navigator)) {
+      alert('WebHID is not available in this browser.');
+      return;
+    }
+    let devices = [];
+    try {
+      devices = (await navigator.hid.getDevices()).filter((d) => d.vendorId === RGB.VENDOR_ID);
+    } catch (e) { /* fall through to picker */ }
+
+    if (!devices.length) {
+      try {
+        devices = (await navigator.hid.requestDevice({
+          filters: [{ vendorId: RGB.VENDOR_ID }],
+        })).filter((d) => d.vendorId === RGB.VENDOR_ID);
+      } catch (e) {
+        console.warn(`HID inspection cancelled: ${e}`);
+        return;
+      }
+    }
+    showInspector(devices);
+  }
+
+  function showInspector(devices) {
+    const overlay = document.createElement('div');
+    overlay.className = 'device-picker-overlay';
+
+    const card = document.createElement('div');
+    card.className = 'device-picker';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'true');
+    card.setAttribute('aria-label', 'HID device inspector');
+    card.style.maxWidth = '900px';
+    card.style.width = 'min(900px, 94vw)';
+
+    const title = document.createElement('h2');
+    title.className = 'device-picker-title';
+    title.textContent = 'HID inspector — read-only';
+
+    const sub = document.createElement('p');
+    sub.className = 'device-picker-sub';
+    sub.textContent = 'Nothing is written here. Plug in whichever transport you want to inspect (wired cable or 2.4GHz dongle), then scan.';
+
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'max-height:48vh;overflow:auto;white-space:pre-wrap;text-align:left;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:12px;margin:12px 0;color:#dbe7ff;';
+    pre.textContent = formatDeviceList(devices);
+
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:8px;';
+
+    const makeBtn = (label, cls, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `btn ${cls}`;
+      b.textContent = label;
+      b.addEventListener('click', fn);
+      return b;
+    };
+
+    const scanBtn = makeBtn('Scan again / add device', 'btn-outline', async () => {
+      try {
+        const picked = (await navigator.hid.requestDevice({
+          filters: [{ vendorId: RGB.VENDOR_ID }],
+        })).filter((d) => d.vendorId === RGB.VENDOR_ID);
+        const merged = [...devices];
+        picked.forEach((d) => { if (!merged.includes(d)) merged.push(d); });
+        devices = merged;
+        pre.textContent = formatDeviceList(devices);
+      } catch (e) {
+        console.warn(`HID scan cancelled: ${e}`);
+      }
+    });
+
+    const readBtn = makeBtn('Read feature reports', 'btn-outline', async () => {
+      readBtn.disabled = true;
+      readBtn.textContent = 'Reading…';
+      try {
+        await dumpFeatureReports(devices, pre);
+      } finally {
+        readBtn.disabled = false;
+        readBtn.textContent = 'Read feature reports';
+      }
+    });
+
+    const copyBtn = makeBtn('Copy', 'btn-ghost', async () => {
+      try {
+        await navigator.clipboard.writeText(pre.textContent);
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1200);
+      } catch (e) {
+        console.warn(`Clipboard failed: ${e}`);
+      }
+    });
+
+    const closeBtn = makeBtn('Close', 'btn-ghost', () => overlay.remove());
+
+    row.append(scanBtn, readBtn, copyBtn, closeBtn);
+    card.append(title, sub, pre, row);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  }
+
+  async function dumpFeatureReports(devices, pre) {
+    const lines = [pre.textContent, '', '── read-only feature report dump ─────────────────────────'];
+    for (const d of devices) {
+      lines.push('');
+      lines.push(`# ${d.productName || '(unnamed)'}  PID 0x${d.productId.toString(16).toUpperCase().padStart(4, '0')}`);
+      let openedHere = false;
+      try {
+        if (!d.opened) { await d.open(); openedHere = true; }
+        const cols = d.collections || [];
+        for (const c of cols) {
+          for (const r of c.featureReports || []) {
+            try {
+              const view = await d.receiveFeatureReport(r.reportId);
+              const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+              lines.push(`  feature #${r.reportId}: ${bytes.length}B  ${hexPreview(bytes)}`);
+            } catch (e) {
+              lines.push(`  feature #${r.reportId}: read failed (${e.message || e})`);
+            }
+          }
+        }
+      } catch (e) {
+        lines.push(`  open failed: ${e.message || e}`);
+      } finally {
+        if (openedHere) { try { await d.close(); } catch (e) { /* ignore */ } }
+      }
+    }
+    pre.textContent = lines.join('\n');
+    pre.scrollTop = pre.scrollHeight;
   }
 
   // ---------------------------------------------------------------------

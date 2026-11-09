@@ -50,12 +50,12 @@ function createWindow() {
   });
 
   ses.setDevicePermissionHandler((details) => {
-    // Only ever grant access to the Portronics Hydra 10 (0x258A / 0x010C).
-    // Granting every HID device would auto-expose a mouse/pad/gamepad to the
-    // renderer, where the probe loop could otherwise grab the first vendor
-    // interface that accepts a feature write.
+    // Grant SinoWealth vendor devices so the dongle can be inspected even
+    // before its PID is known. The renderer still hard-filters every connect
+    // path (VID/PID + vendor page), and dongle writes stay blocked until the
+    // user explicitly allows them.
     if (details.deviceType !== 'hid') return false;
-    return details.device.vendorId === 0x258a && details.device.productId === 0x010c;
+    return details.device.vendorId === 0x258a;
   });
 
   // No 'select-hid-device' listener: when unhandled, Electron displays its

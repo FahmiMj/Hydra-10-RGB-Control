@@ -437,6 +437,8 @@ const RGB = (() => {
       }
 
       if (!picked) {
+        device = null;
+        reportStrategy = null;
         setStatus('error', 'No working report strategy found');
         log('Could not find a report the device accepts', 'error');
         return false;
