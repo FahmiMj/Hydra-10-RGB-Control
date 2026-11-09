@@ -5,9 +5,9 @@ A desktop RGB control console for the [Portronics Hydra 10](https://www.portroni
 Electron and WebHID, it streams lighting frames to the board in real time at
 ~30fps and renders a live 3D preview of the current effect.
 
-Wired USB is fully supported. **2.4 GHz dongle support is experimental** and
-depends on the receiver exposing the same vendor RGB report channel as the
-wired board.
+Wired USB is fully supported. **2.4 GHz dongle support is experimental but
+verified** on the Compx `3554:FA09` receiver (the same receiver family used by
+the AULA F75); see [the dongle protocol](#24-ghz-dongle-protocol-verified).
 
 ![Arc Console screenshot](docs/screenshot.png)
 
@@ -36,10 +36,9 @@ wired board.
 
 ## Requirements
 
-- **Wired USB is the supported transport.** 2.4 GHz dongle support is
-  experimental and only works if the receiver advertises feature report #6
-  (519 bytes) or output report #0 (520 bytes) on a vendor page (`0xFF00`).
-  WebHID cannot see the keyboard over Bluetooth.
+- **Wired USB and the Compx 2.4 GHz receiver are supported.** The receiver
+  (`3554:FA09`) uses a completely different protocol from the wired board and
+  is auto-detected; see below. WebHID cannot see the keyboard over Bluetooth.
 - Windows 10/11 (target platform)
 - Google Chrome, Microsoft Edge, or Brave — Chromium-based browsers only,
   as WebHID is not supported in Firefox or Safari.
@@ -60,26 +59,61 @@ wired board.
 If multiple devices are connected, a menu lets you select which one to
 control. Any non-Hydra HID device is always ignored.
 
-### Experimental: 2.4 GHz dongle
+### 2.4 GHz dongle (experimental, verified on hardware)
 
-The receiver is a **separate USB device** with its own VID/PID and report
-map, so it must be identified before anything is written to it.
+The receiver is a **separate USB device** (`Compx 3554:FA09`, product
+`Hydra 10`) with its own report map, and it does **not** speak the wired
+519-byte feature protocol. It is auto-detected by VID/PID.
 
-1. Open **Diagnostics → Inspect HID devices (read-only)**.
-2. Insert the dongle (and switch the keyboard to 2.4 GHz mode), then
-   **Scan again / add device**. Note the receiver's VID/PID and whether it
-   exposes `feature #6` (roughly 519 bytes) or `output #0` (roughly 520 bytes)
-   on usage page `0xFF00`.
-3. In Diagnostics, tick **Dongle mode**, enter the receiver PID (hex), and
-   connect.
-4. Only after confirming the report channel, tick **Allow RGB writes over
-   2.4 GHz**. Writes stay blocked until then, and the stream is capped at
-   20 fps on the wireless link.
+1. Insert the receiver and switch the board to **2.4 GHz mode**.
+2. Open **Diagnostics** and tick **Dongle mode** (VID/PID default to
+   `3554`/`FA09`; only change them for a different receiver).
+3. Tick **Allow RGB writes over 2.4 GHz** and confirm the prompt.
+4. Connect and choose an effect.
 
-If the receiver only exposes a boot keyboard collection (no vendor page),
-the 2.4 GHz link simply does not tunnel lighting and this project cannot
-control it. Do **not** force other report IDs — that risks writing into the
-keyboard's config zone.
+Writes stay blocked until step 3. The app only ever sends lighting command
+`0x88`; it **never** sends the config command `0x04`, which writes
+non-volatile storage and has been confirmed to stop keyboards typing.
+
+#### 2.4 GHz dongle protocol (verified)
+
+Decoded from the public [keylux protocol notes](https://github.com/SibteProf/keylux/blob/main/docs/PROTOCOL.md)
+and verified here on 2026-11-09 by lighting LED `0x37` (the `9` key) cyan on a
+Portronics Hydra 10 through the receiver.
+
+- **Interface:** interface 1, vendor usage page `0xFF02`.
+- **Channel:** HID **output report `0x13`**, 19-byte payload (20 bytes on the
+  wire including the report ID).
+- **Command:** `0x88` (live lighting) only.
+- **Chunking:** 14 payload bytes per chunk, ~13 ms apart.
+- **Frame:**
+
+  ```
+  byte 0      0x13 report ID
+  byte 1      0x88 command (lighting)
+  byte 2      total chunks in this message
+  byte 3      chunk index (0-based)
+  byte 4      0x10 + payload length in this chunk
+  bytes 5..18 payload, zero padded
+  byte 19     checksum = sum(bytes 0..18) & 0xFF
+  ```
+
+- **Payload:** a sequence of `[R, G, B, count, ledIndex...]` groups.
+  Solid cyan on LED `0x37` is `13 88 01 00 15 00 ff ff 01 37 … e7`.
+- **LED indices** are the same matrix indices the wired protocol uses
+  (`0x37` = `9` on this 68-key layout).
+
+The 7-byte feature report `#6` on usage page `0xFF04` is a **trap**: it uses
+the wired report ID but is only a status report. The app never writes to it.
+
+The link is throughput-limited. The app caps wireless output at roughly
+60 chunks/second (a 6-chunk full-board frame runs at ~10 fps) and skips
+unchanged frames. A smooth whole-board effect should still use the cable;
+static colours and sparse effects work well over radio.
+
+If a different receiver exposes no output report `0x13`, the app refuses to
+write rather than probing unknown reports. Do **not** force other report IDs —
+that risks writing into the keyboard's config zone.
 
 ## Development
 
@@ -114,8 +148,8 @@ npm run dist:win    # produces NSIS installer + portable exe in release/
   2.4 GHz receiver, run the read-only HID inspector and enter its PID.
 - **Keyboard doesn't light up** — confirm your board is the Portronics
   Hydra 10 (wired VID `0x258A`, PID `0x010C`) and try the test report buttons
-  in the Diagnostics panel. Over 2.4 GHz, check that the receiver exposes
-  the vendor RGB report channel first.
+  in the Diagnostics panel. Over 2.4 GHz, confirm the receiver is
+  `3554:FA09` and that **Dongle mode** plus **Allow RGB writes** are ticked.
 - **Preview works but board is dark** — check that the status pill shows
   `Linked`; if the strategy was auto-negotiated as an output report, the
   diagnostics panel will show which report is in use.
@@ -126,6 +160,11 @@ The key-to-LED mapping and protocol details are based on MRtojisan's
 [portronics-hydra-10-SignalRGB-Plugin](https://github.com/MRtojisan/portronics-hydra-10-SignalRGB-Plugin) —
 an unofficial SignalRGB plugin for the Portronics Hydra 10. Check it out if
 you want full desktop synchronization and game sync via SignalRGB.
+
+The 2.4 GHz receiver protocol was decoded by
+[SibteProf/keylux](https://github.com/SibteProf/keylux) — see its
+[`PROTOCOL.md`](https://github.com/SibteProf/keylux/blob/main/docs/PROTOCOL.md).
+Without that write-up this dongle path would have cost another bricked board.
 
 ## License
 

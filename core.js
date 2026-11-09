@@ -558,14 +558,14 @@ const RGB = (() => {
         log(`Probing ${device.productName || 'device'} [${mode.toUpperCase()}]: ${summarizeCollections(device.collections)}`);
 
         if (!hasRgbReportChannel(d)) {
-          log('No RGB report channel (feature #6 / output #0) advertised — skipping, no blind writes', 'warn');
+          log('No verified RGB channel (wired feature #6 / output #0, or dongle output #0x13) advertised — skipping, no blind writes', 'warn');
           try { await d.close(); } catch (e) {}
           continue;
         }
 
         if (mode === 'dongle' && !dongleWritesConfirmed) {
           setStatus('error', 'Dongle is read-only until writes are allowed');
-          log('Refusing to write RGB frames over 2.4GHz. Inspect the dongle first, then tick "Allow RGB writes" in Diagnostics.', 'warn');
+          log('Refusing to write RGB frames over 2.4GHz. Tick "Allow RGB writes" in Diagnostics first.', 'warn');
           try { await d.close(); } catch (e) {}
           device = null;
           return false;
