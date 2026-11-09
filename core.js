@@ -566,7 +566,14 @@ const RGB = (() => {
   }
 
   function transportMode(d) {
-    return d && d.productId !== PRODUCT_ID ? 'dongle' : 'wired';
+    if (!d) return 'wired';
+    // Explicit dongle mode always wins: if the receiver reuses the wired
+    // PID, the write gate and 20fps cap must still apply.
+    if (transport.dongle) return 'dongle';
+    if (d.productId !== PRODUCT_ID) return 'dongle';
+    const name = String(d.productName || '').toLowerCase();
+    if (/receiver|dongle|2\.4\s*ghz|wireless/.test(name)) return 'dongle';
+    return 'wired';
   }
 
   // requestDevice() can only be filtered by VID/PID, so build the filter from
