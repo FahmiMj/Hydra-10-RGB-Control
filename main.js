@@ -50,12 +50,12 @@ function createWindow() {
   });
 
   ses.setDevicePermissionHandler((details) => {
-    // Grant SinoWealth vendor devices so the dongle can be inspected even
-    // before its PID is known. The renderer still hard-filters every connect
-    // path (VID/PID + vendor page), and dongle writes stay blocked until the
-    // user explicitly allows them.
+    // Grant the wired SinoWealth board (0x258A) and the Compx 2.4GHz
+    // receiver (0x3554). The renderer still hard-filters every connect path
+    // (VID/PID + verified report channel), and dongle writes stay blocked
+    // until the user explicitly allows them.
     if (details.deviceType !== 'hid') return false;
-    return details.device.vendorId === 0x258a;
+    return details.device.vendorId === 0x258a || details.device.vendorId === 0x3554;
   });
 
   // No 'select-hid-device' listener: when unhandled, Electron displays its

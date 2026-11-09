@@ -484,31 +484,40 @@
 
   function bindDongleControls() {
     const toggle = $('#dongle-toggle');
+    const vidInput = $('#dongle-vid');
     const pidInput = $('#dongle-pid');
     const writes = $('#dongle-writes');
-    if (!toggle || !pidInput || !writes) return;
+    if (!toggle || !vidInput || !pidInput || !writes) return;
 
     const saved = RGB.getDongleMode();
     toggle.checked = !!saved.enabled;
     writes.checked = !!saved.allowWrites;
-    if (saved.pid) pidInput.value = saved.pid.toString(16).toUpperCase().padStart(4, '0');
+    vidInput.value = (saved.vid || RGB.DONGLE_VID).toString(16).toUpperCase().padStart(4, '0');
+    pidInput.value = (saved.pid || RGB.DONGLE_PID).toString(16).toUpperCase().padStart(4, '0');
 
     const sync = () => {
       if (!toggle.checked) writes.checked = false;
       writes.disabled = !toggle.checked;
+      vidInput.disabled = !toggle.checked;
       pidInput.disabled = !toggle.checked;
-      RGB.setDongleMode(toggle.checked, parseHexPid(pidInput.value), writes.checked);
+      RGB.setDongleMode(
+        toggle.checked,
+        parseHexPid(vidInput.value),
+        parseHexPid(pidInput.value),
+        writes.checked
+      );
     };
 
     toggle.addEventListener('change', sync);
+    vidInput.addEventListener('change', sync);
     pidInput.addEventListener('change', sync);
     writes.addEventListener('change', () => {
       if (writes.checked) {
         const ok = confirm(
-          'Allow 519-byte RGB writes over the 2.4GHz receiver?\n\n' +
-          'Only continue if you have inspected the dongle and confirmed it exposes ' +
-          'feature report #6 (519B) or output report #0 (520B). Wrong writes to an ' +
-          'unverified vendor report can corrupt keyboard settings.'
+          'Allow RGB lighting writes over the 2.4GHz receiver?\n\n' +
+          'This app only sends command 0x88 (live lighting) on output report 0x13. ' +
+          'It never writes the config command 0x04. Make sure the keyboard is awake ' +
+          'and switched to 2.4GHz mode.'
         );
         if (!ok) { writes.checked = false; sync(); return; }
       }

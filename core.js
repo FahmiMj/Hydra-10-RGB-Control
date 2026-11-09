@@ -22,10 +22,18 @@ const RGB = (() => {
   // ---------------------------------------------------------------------
   const VENDOR_ID = 0x258A;
   const PRODUCT_ID = 0x010C; // wired USB build
-  // 2.4GHz receivers are separate USB devices and may use a different PID.
-  // Populate this only after inspecting a real dongle (PIDs are added here
-  // once verified; the UI also accepts a PID explicit per session).
-  const DONGLE_PIDS = [];
+
+  // 2.4GHz receiver (Compx 3554:fa09, used across the F75/Hydra 10 family).
+  // It does NOT carry the wired 519-byte feature protocol; it speaks a
+  // chunked output-report protocol on interface 1 (vendor page 0xFF02).
+  const DONGLE_VID = 0x3554;
+  const DONGLE_PID = 0xFA09;
+  const DONGLE_REPORT_ID = 0x13;
+  const DONGLE_REPORT_SIZE = 19;
+  const DONGLE_CHUNK = 14; // payload bytes per 19-byte output report
+  const DONGLE_MAX_CHUNKS = 10; // <= ~64 chunks/s at the paced frame interval
+  const DONGLE_CHUNK_GAP_MS = 13;
+  const DONGLE_CMD_LIGHTING = 0x88; // the ONLY command this app ever sends
 
   const DEFAULT_REPORT_ID = 6;
   const REPORT_SIZE = 519; // total payload length, including RGB data + padding
@@ -143,22 +151,26 @@ const RGB = (() => {
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 5;
 
-  // 2.4GHz support is opt-in. The receiver's report map is NOT guaranteed to
-  // match the wired board's, so RGB writes stay blocked until the user has
+  // 2.4GHz support is opt-in. The receiver's protocol is different from the
+  // wired board's, so lighting writes stay blocked until the user has
   // inspected the dongle and explicitly allowed them for this session.
   let transport = loadTransport();
   let dongleWritesConfirmed = false;
   let sendIntervalMs = 0; // dongle links get throttled; wired stays unthrottled
+  let lastDongleHash = null;
+  let lastDongleSentAt = 0;
 
   const state = loadState();
 
   function loadTransport() {
-    const fallback = { dongle: false, pid: null };
+    const fallback = { dongle: false, vid: DONGLE_VID, pid: DONGLE_PID };
     try {
+      const vid = parseInt(localStorage.getItem('rgb-dongle-vid') || '', 16);
       const pid = parseInt(localStorage.getItem('rgb-dongle-pid') || '', 16);
       return {
         dongle: localStorage.getItem('rgb-dongle-enabled') === '1',
-        pid: Number.isFinite(pid) && pid > 0 ? pid : null,
+        vid: Number.isFinite(vid) && vid > 0 ? vid : DONGLE_VID,
+        pid: Number.isFinite(pid) && pid > 0 ? pid : DONGLE_PID,
       };
     } catch (e) {
       return fallback;
@@ -330,6 +342,128 @@ const RGB = (() => {
   }
 
   // ---------------------------------------------------------------------
+  // 2.4GHz dongle frame builder
+  // ---------------------------------------------------------------------
+  // Frame (20B on the wire, 19B in WebHID's sendReport payload):
+  //   [0x13][cmd][totalChunks][chunkIndex][0x10+len][14 payload][checksum]
+  // Lighting payload is a sequence of groups: [R,G,B,count,ledIndex...].
+  // Only command 0x88 (live lighting) is ever emitted. The config command
+  // 0x04 is deliberately not implemented: it writes non-volatile storage.
+  function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const d = max - min;
+    let h = 0;
+    if (d) {
+      if (max === r) h = ((g - b) / d) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h *= 60;
+      if (h < 0) h += 360;
+    }
+    return [h, max === 0 ? 0 : d / max, max];
+  }
+
+  function quantizeHsv(rgb, hSteps, sSteps, vSteps) {
+    const [h, s, v] = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+    if (v < 0.04) return [0, 0, 0];
+    const hq = hSteps <= 1 ? 0 : (Math.round((h / 360) * hSteps) % hSteps);
+    const sq = sSteps <= 1 ? 1 : Math.max(1 / (sSteps - 1), Math.round(s * (sSteps - 1)) / (sSteps - 1));
+    const vq = vSteps <= 1 ? 1 : Math.max(1 / (vSteps - 1), Math.round(v * (vSteps - 1)) / (vSteps - 1));
+    return hsvToRgb((hq / hSteps) * 360, sq, vq);
+  }
+
+  function buildDongleGroups(perLed, palette) {
+    const buckets = new Map();
+    for (const key of KEY_LAYOUT) {
+      let c = perLed[key.ledIndex] || [0, 0, 0];
+      c = [c[0] | 0, c[1] | 0, c[2] | 0];
+      if (!palette.exact) c = quantizeHsv(c, palette.h, palette.s, palette.v);
+      const k = `${c[0]},${c[1]},${c[2]}`;
+      if (!buckets.has(k)) buckets.set(k, { color: c, indices: [] });
+      buckets.get(k).indices.push(key.ledIndex);
+    }
+    return Array.from(buckets.values());
+  }
+
+  function encodeDongleGroups(groups) {
+    const out = [];
+    for (const g of groups) {
+      out.push(g.color[0], g.color[1], g.color[2], g.indices.length);
+      for (const idx of g.indices) out.push(idx);
+    }
+    return out;
+  }
+
+  function chunkDonglePayload(payload) {
+    if (!payload.length) return [];
+    const total = Math.ceil(payload.length / DONGLE_CHUNK);
+    if (total > 255) return [];
+    const chunks = [];
+    for (let i = 0; i < total; i++) {
+      const part = payload.slice(i * DONGLE_CHUNK, (i + 1) * DONGLE_CHUNK);
+      const data = new Uint8Array(DONGLE_REPORT_SIZE);
+      data[0] = DONGLE_CMD_LIGHTING;
+      data[1] = total;
+      data[2] = i;
+      data[3] = 0x10 + part.length;
+      for (let j = 0; j < part.length; j++) data[4 + j] = part[j];
+      // Checksum covers the real report-ID byte (0x13) + bytes 0..17.
+      let sum = DONGLE_REPORT_ID;
+      for (let j = 0; j < 18; j++) sum = (sum + data[j]) & 0xff;
+      data[18] = sum;
+      chunks.push(data);
+    }
+    return chunks;
+  }
+
+  const DONGLE_PALETTES = [
+    { exact: true },
+    { h: 12, s: 2, v: 4 },
+    { h: 8, s: 2, v: 3 },
+    { h: 6, s: 2, v: 2 },
+    { h: 4, s: 2, v: 2 },
+    { h: 3, s: 2, v: 1 },
+    { h: 2, s: 2, v: 1 },
+    { h: 1, s: 1, v: 1 },
+  ];
+
+  function averageDongleGroups(perLed) {
+    let r = 0, g = 0, b = 0, n = 0;
+    for (const key of KEY_LAYOUT) {
+      const c = perLed[key.ledIndex] || [0, 0, 0];
+      r += c[0]; g += c[1]; b += c[2]; n++;
+    }
+    return [{
+      color: [Math.round(r / n), Math.round(g / n), Math.round(b / n)],
+      indices: KEY_LAYOUT.map((k) => k.ledIndex),
+    }];
+  }
+
+  // Pick the richest palette that still fits the wireless chunk budget.
+  // Full frames (not deltas) keep the encoder simple; the link budget is
+  // enforced by DONGLE_MAX_CHUNKS + the per-chunk gap.
+  function buildDongleChunks(perLed) {
+    for (const palette of DONGLE_PALETTES) {
+      const chunks = chunkDonglePayload(encodeDongleGroups(buildDongleGroups(perLed, palette)));
+      if (chunks.length && chunks.length <= DONGLE_MAX_CHUNKS) return chunks;
+    }
+    return chunkDonglePayload(encodeDongleGroups(averageDongleGroups(perLed)));
+  }
+
+  function hashChunks(chunks) {
+    let h = 2166136261 >>> 0;
+    for (const c of chunks) {
+      for (let i = 0; i < c.length; i++) {
+        h ^= c[i];
+        h = Math.imul(h, 16777619);
+      }
+    }
+    return h >>> 0;
+  }
+
+  // ---------------------------------------------------------------------
   // Transport — connect, strategy auto-detection, send
   // ---------------------------------------------------------------------
   async function connect() {
@@ -366,8 +500,8 @@ const RGB = (() => {
         }
       }
       if (!devices.length) {
-        if (transport.dongle && !transport.pid) {
-          log('Dongle mode is on but no receiver PID is set. Use "Inspect HID devices", enter the dongle PID, then connect.', 'warn');
+        if (transport.dongle) {
+          log(`Dongle mode is on but no matching receiver was found. Expected 0x${DONGLE_VID.toString(16)}:0x${DONGLE_PID.toString(16)} (or the manual VID:PID).`, 'warn');
         }
         setStatus('idle');
         return false;
@@ -454,7 +588,7 @@ const RGB = (() => {
       }
 
       const pickedMode = transportMode(picked);
-      sendIntervalMs = pickedMode === 'dongle' ? 50 : 0; // 20fps cap on 2.4GHz
+      sendIntervalMs = pickedMode === 'dongle' ? 120 : 0; // wireless is chunk-paced
       device.addEventListener('inputreport', onInputReport);
       bindVisibility();
       startStreaming();
@@ -477,31 +611,61 @@ const RGB = (() => {
   async function detectReportStrategy(forced) {
     if (!device) return false;
 
-    // Only ever use the two verified RGB channels, and only when the device's
-    // own report descriptor advertises them. There is deliberately NO fallback
-    // scan over other report IDs: writing 519 bytes into an unknown vendor
-    // report can corrupt the board's config zone.
-    const candidates = [];
+    const mode = transportMode(device);
+
     if (forced) {
-      const validForced =
+      const validDongle = forced.kind === 'dongle' &&
+        forced.reportId === DONGLE_REPORT_ID && forced.size === DONGLE_REPORT_SIZE;
+      const validWired =
         (forced.kind === 'feature' && forced.reportId === DEFAULT_REPORT_ID && forced.size === REPORT_SIZE) ||
         (forced.kind === 'output' && forced.reportId === 0 && forced.size === REPORT_SIZE + 1);
-      if (!validForced) {
-        log('Refusing unknown report strategy — only feature #6 (519B) and output #0 (520B) are allowed', 'error');
+      if (!validDongle && !validWired) {
+        log('Refusing unknown report strategy — only the verified wired and dongle RGB channels are allowed', 'error');
         return false;
       }
-      candidates.push(forced);
-    } else {
-      if (findReport(device, 'feature', DEFAULT_REPORT_ID)) {
-        candidates.push({ kind: 'feature', reportId: DEFAULT_REPORT_ID, size: REPORT_SIZE });
+      if (validDongle) {
+        if (!findReport(device, 'output', DONGLE_REPORT_ID)) {
+          log('This device does not advertise output report 0x13', 'error');
+          return false;
+        }
+        reportStrategy = forced;
+        log('Using dongle lighting channel output #0x13 (19B chunked, command 0x88)');
+        return true;
       }
-      if (findReport(device, 'output', 0)) {
-        candidates.push({ kind: 'output', reportId: 0, size: REPORT_SIZE + 1 });
+      reportStrategy = forced;
+      const testBuf = new Uint8Array(forced.size);
+      testBuf.set(HEADER, 0);
+      return tryWrite(forced, testBuf);
+    }
+
+    // 2.4GHz receiver: output report 0x13 on interface 1. Detection is
+    // descriptor-only — no probe write is needed (and the receiver's 7-byte
+    // feature report #6 is a status report, not a colour pipe).
+    if (mode === 'dongle') {
+      const o13 = findReport(device, 'output', DONGLE_REPORT_ID);
+      if (!o13) {
+        log('Dongle does not advertise the 19-byte output report 0x13 — refusing to probe other reports', 'error');
+        return false;
       }
+      reportStrategy = { kind: 'dongle', reportId: DONGLE_REPORT_ID, size: DONGLE_REPORT_SIZE };
+      log('Using dongle lighting channel output #0x13 (19B chunked, command 0x88)');
+      return true;
+    }
+
+    // Wired: only the two verified RGB channels, and only when the report
+    // descriptor advertises them. No fallback scan over other report IDs —
+    // writing a large frame into an unknown vendor report can corrupt the
+    // board's config zone.
+    const candidates = [];
+    if (findReport(device, 'feature', DEFAULT_REPORT_ID)) {
+      candidates.push({ kind: 'feature', reportId: DEFAULT_REPORT_ID, size: REPORT_SIZE });
+    }
+    if (findReport(device, 'output', 0)) {
+      candidates.push({ kind: 'output', reportId: 0, size: REPORT_SIZE + 1 });
     }
 
     if (!candidates.length) {
-      log('Device advertises neither feature #6 nor output #0 — not an RGB channel', 'error');
+      log('Device advertises neither feature #6 nor output #0 — not a wired RGB channel', 'error');
       return false;
     }
 
@@ -550,47 +714,52 @@ const RGB = (() => {
     }
   }
 
-  // Strict identity check for supported Hydra hardware. The wired board is
-  // always accepted; a dongle is accepted only once its PID has been verified
-  // (built-in list) or entered explicitly in the Diagnostics panel.
-  function supportedPid(d) {
+  // Strict identity check for supported Hydra hardware. Both transports are
+  // hard-coded after inspection; a manual VID/PID override is only consulted
+  // while dongle mode is explicitly enabled.
+  function supportedDevice(d) {
     if (!d) return null;
-    if (d.productId === PRODUCT_ID) return 'wired';
-    if (transport.pid && d.productId === transport.pid) return 'dongle';
-    if (DONGLE_PIDS.includes(d.productId)) return 'dongle';
+    if (d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID) return 'wired';
+    if (d.vendorId === DONGLE_VID && d.productId === DONGLE_PID) return 'dongle';
+    if (transport.dongle && d.vendorId === transport.vid && d.productId === transport.pid) return 'dongle';
     return null;
   }
 
   function isHydra(d) {
-    return !!(d && d.vendorId === VENDOR_ID && supportedPid(d));
+    return !!supportedDevice(d);
   }
 
   function transportMode(d) {
     if (!d) return 'wired';
-    // Explicit dongle mode always wins: if the receiver reuses the wired
-    // PID, the write gate and 20fps cap must still apply.
+    if (d.vendorId === DONGLE_VID && d.productId === DONGLE_PID) return 'dongle';
+    // Explicit dongle mode always wins: if a receiver reuses the wired
+    // PID, the write gate and wireless pacing must still apply.
     if (transport.dongle) return 'dongle';
-    if (d.productId !== PRODUCT_ID) return 'dongle';
+    if (d.vendorId !== VENDOR_ID || d.productId !== PRODUCT_ID) return 'dongle';
     const name = String(d.productName || '').toLowerCase();
     if (/receiver|dongle|2\.4\s*ghz|wireless/.test(name)) return 'dongle';
     return 'wired';
   }
 
   // requestDevice() can only be filtered by VID/PID, so build the filter from
-  // the known IDs. If dongle mode is on but no PID is set yet, widen to the
-  // vendor ID only so the user can see what the receiver reports.
+  // both known transports plus any manual override.
   function deviceFilters() {
-    if (transport.dongle && !transport.pid) return [{ vendorId: VENDOR_ID }];
-    const pids = new Set([PRODUCT_ID, ...DONGLE_PIDS]);
-    if (transport.pid) pids.add(transport.pid);
-    return Array.from(pids, (productId) => ({ vendorId: VENDOR_ID, productId }));
+    const ids = [
+      { vendorId: VENDOR_ID, productId: PRODUCT_ID },
+      { vendorId: DONGLE_VID, productId: DONGLE_PID },
+    ];
+    if (transport.dongle && (transport.vid !== DONGLE_VID || transport.pid !== DONGLE_PID)) {
+      ids.push({ vendorId: transport.vid, productId: transport.pid });
+    }
+    return ids;
   }
 
-  // The board's RGB bulk-channel (report 6) exists only on collections with
-  // the vendor usage page 0xFF00. Prefer devices whose collections expose one.
+  // The RGB channel lives on a vendor page (0xF000 range): 0xFF00 for the
+  // wired board, 0xFF02 for the receiver's output channel, 0xFF04 for its
+  // (useless) 7-byte status feature report.
   function isVendorDevice(d) {
     return (d.collections || []).some(
-      (c) => c.usagePage === 0xff00 || (c.featureReports || []).some((r) => r.reportId === DEFAULT_REPORT_ID)
+      (c) => c.usagePage >= 0xff00 && c.usagePage <= 0xffff
     );
   }
 
@@ -613,17 +782,22 @@ const RGB = (() => {
   }
 
   // Only treat a device as an RGB target when its descriptors actually
-  // advertise the 519-byte feature channel or the 520-byte output channel.
-  // This is what prevents writing a 519-byte frame into some other vendor
+  // advertise one of the verified channels:
+  //   wired : feature #6 (~519B) or output #0 (~520B)
+  //   dongle: output #0x13 (19B) on the receiver's vendor interface
+  // This is what prevents writing a large frame into an unrelated vendor
   // report on a receiver whose report map we have not verified.
   function hasRgbReportChannel(d) {
     const f6 = findReport(d, 'feature', DEFAULT_REPORT_ID);
     const o0 = findReport(d, 'output', 0);
+    const o13 = findReport(d, 'output', DONGLE_REPORT_ID);
     const f6bytes = f6 ? reportBytes(f6) : 0;
     const o0bytes = o0 ? reportBytes(o0) : 0;
+    const o13bytes = o13 ? reportBytes(o13) : 0;
     return !!(
       (f6 && (f6bytes === 0 || f6bytes >= REPORT_SIZE - 8)) ||
-      (o0 && (o0bytes === 0 || o0bytes >= REPORT_SIZE))
+      (o0 && (o0bytes === 0 || o0bytes >= REPORT_SIZE)) ||
+      (o13 && (o13bytes === 0 || o13bytes >= DONGLE_REPORT_SIZE))
     );
   }
 
@@ -667,12 +841,68 @@ const RGB = (() => {
     log(`inputreport id=${e.reportId} len=${e.data.byteLength}`, 'debug');
   }
 
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Chunked 2.4GHz frame writer. Only DONGLE_CMD_LIGHTING (0x88) frames are
+  // produced by buildDongleChunks(); the config command is unreachable here.
+  async function sendDongleFrame(perLed, force) {
+    if (!device || !device.opened || !reportStrategy) return false;
+    const chunks = buildDongleChunks(perLed);
+    if (!chunks.length) return false;
+    const now = performance.now();
+    const hash = hashChunks(chunks);
+
+    if (!force) {
+      if (sendIntervalMs && now - lastFrameTime < sendIntervalMs) return true;
+      // Static image: do not resend every tick. Refresh every 2s in case the
+      // firmware repaints behind us.
+      if (hash === lastDongleHash && now - lastDongleSentAt < 2000) return true;
+    }
+
+    isSending = true;
+    let ok = true;
+    for (let i = 0; i < chunks.length; i++) {
+      try {
+        await device.sendReport(DONGLE_REPORT_ID, chunks[i]);
+      } catch (e) {
+        ok = false;
+        log(`Dongle chunk ${i + 1}/${chunks.length} rejected: ${e.message || e}`, 'warn');
+        break;
+      }
+      // Space control transfers ~13ms apart; the frame time IS the gaps.
+      if (i < chunks.length - 1) await sleep(DONGLE_CHUNK_GAP_MS);
+    }
+    isSending = false;
+
+    if (!ok) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        consecutiveFailures = 0;
+        log('Dongle writes failing repeatedly — link idle. Check that the keyboard is awake and in 2.4GHz mode.', 'warn');
+      }
+      return false;
+    }
+
+    lastDongleHash = hash;
+    lastDongleSentAt = performance.now();
+    lastFrameTime = performance.now();
+    // 16ms per chunk keeps the link under ~64 chunks/s (the measured clean
+    // ceiling); sparse frames finish sooner and can tick faster.
+    sendIntervalMs = Math.max(100, chunks.length * 16);
+    consecutiveFailures = 0;
+    return true;
+  }
+
   async function sendFrame(perLed) {
     // Never overlap writes: the USB device can't queue them. If a frame is
     // still in flight (async write outstanding), drop this one and let the
     // next rAF tick carry the latest frame data instead.
     if (!device || !device.opened || !reportStrategy || isSending) return;
-    // 2.4GHz links cannot absorb 30-60 frames/sec of 519-byte vendor traffic.
+    if (reportStrategy.kind === 'dongle') {
+      await sendDongleFrame(perLed);
+      return;
+    }
+    // Wired links are not throttled; keep the verified 30fps+ behaviour.
     if (sendIntervalMs && performance.now() - lastFrameTime < sendIntervalMs) return;
     isSending = true;
     const buf = buildPacket(perLed);
@@ -699,6 +929,20 @@ const RGB = (() => {
       log('Connect first — refusing to write a test report to an unverified channel', 'warn');
       return false;
     }
+    if (reportStrategy.kind === 'dongle') {
+      if (!dongleWritesConfirmed) {
+        log('Refusing test write over 2.4GHz — allow writes in Diagnostics first', 'warn');
+        return false;
+      }
+      if (isSending) {
+        log('Stream is busy — try the test again in a moment', 'warn');
+        return false;
+      }
+      const test = new Array(LED_COUNT).fill(null).map(() => [0, 255, 255]);
+      const ok = await sendDongleFrame(test, true);
+      log(`Dongle test frame (all cyan, cmd 0x88): ${ok ? 'sent' : 'failed'}`, ok ? 'info' : 'error');
+      return ok;
+    }
     const size = overrideSize || reportStrategy.size;
     const reportId = overrideReportId != null ? overrideReportId : reportStrategy.reportId;
     const allowed =
@@ -706,10 +950,6 @@ const RGB = (() => {
       (reportStrategy.kind === 'output' && reportId === 0 && size === REPORT_SIZE + 1);
     if (!allowed) {
       log(`Refusing test write to ${reportStrategy.kind} #${reportId} @ ${size}B — only the verified RGB channel is allowed`, 'error');
-      return false;
-    }
-    if (transportMode(device) === 'dongle' && !dongleWritesConfirmed) {
-      log('Refusing test write over 2.4GHz — allow writes in Diagnostics first', 'warn');
       return false;
     }
     const strategy = { kind: reportStrategy.kind, reportId, size };
@@ -751,7 +991,7 @@ const RGB = (() => {
           }
           const ok = await detectReportStrategy();
           if (ok) {
-            sendIntervalMs = mode === 'dongle' ? 50 : 0;
+            sendIntervalMs = mode === 'dongle' ? 120 : 0;
             device.addEventListener('inputreport', onInputReport);
             startStreaming();
             setStatus('connected', { name: device.productName, strategy: reportStrategy, mode });
@@ -893,31 +1133,41 @@ const RGB = (() => {
       log('Connect first — no device to switch reports on', 'warn');
       return;
     }
-    const defaultSize = reportId === 0 ? REPORT_SIZE + 1 : REPORT_SIZE;
+    const defaultSize = kind === 'dongle'
+      ? DONGLE_REPORT_SIZE
+      : (reportId === 0 ? REPORT_SIZE + 1 : REPORT_SIZE);
     detectReportStrategy({ kind, reportId, size: size || defaultSize });
   }
 
   // ---------------------------------------------------------------------
   // 2.4GHz dongle controls (opt-in; see transport block at the top)
   // ---------------------------------------------------------------------
-  function setDongleMode(enabled, pid, allowWrites) {
-    const nextPid = Number.isFinite(pid) && pid > 0 ? pid : null;
-    transport = { dongle: !!enabled, pid: nextPid };
+  function setDongleMode(enabled, vid, pid, allowWrites) {
+    const nextVid = Number.isFinite(vid) && vid > 0 ? vid : DONGLE_VID;
+    const nextPid = Number.isFinite(pid) && pid > 0 ? pid : DONGLE_PID;
+    transport = { dongle: !!enabled, vid: nextVid, pid: nextPid };
     dongleWritesConfirmed = !!(enabled && allowWrites);
     try {
       localStorage.setItem('rgb-dongle-enabled', transport.dongle ? '1' : '0');
-      localStorage.setItem('rgb-dongle-pid', nextPid ? nextPid.toString(16).padStart(4, '0') : '');
+      localStorage.setItem('rgb-dongle-vid', nextVid.toString(16).padStart(4, '0'));
+      localStorage.setItem('rgb-dongle-pid', nextPid.toString(16).padStart(4, '0'));
     } catch (e) { /* storage unavailable, non-fatal */ }
     log(
-      `Dongle mode ${transport.dongle ? 'enabled' : 'disabled'}` +
-      (nextPid ? ` (PID 0x${nextPid.toString(16).toUpperCase()})` : '') +
+      `Dongle mode ${transport.dongle ? 'enabled' : 'disabled'} ` +
+      `(VID 0x${nextVid.toString(16).toUpperCase()} / PID 0x${nextPid.toString(16).toUpperCase()})` +
       `, RGB writes ${dongleWritesConfirmed ? 'ALLOWED' : 'blocked'}`,
       transport.dongle && dongleWritesConfirmed ? 'warn' : 'info'
     );
   }
 
   function getDongleMode() {
-    return { enabled: transport.dongle, pid: transport.pid, allowWrites: dongleWritesConfirmed };
+    return {
+      enabled: transport.dongle,
+      vid: transport.vid,
+      pid: transport.pid,
+      allowWrites: dongleWritesConfirmed,
+      writesAllowed: dongleWritesConfirmed,
+    };
   }
 
   function getMode() {
@@ -925,7 +1175,8 @@ const RGB = (() => {
   }
 
   return {
-    VENDOR_ID, PRODUCT_ID, DONGLE_PIDS, DEFAULT_REPORT_ID, REPORT_SIZE, LED_COUNT, SPECTRUM,
+    VENDOR_ID, PRODUCT_ID, DONGLE_VID, DONGLE_PID, DONGLE_REPORT_ID,
+    DEFAULT_REPORT_ID, REPORT_SIZE, LED_COUNT, SPECTRUM,
     LED_LAYOUT, KEY_LAYOUT, LAYOUT_TOTAL_W, LAYOUT_ROWS,
     connect, disconnect, sendTestReport,
     setEffect, setColor, setBrightness, setSpeed, setPerKeyColor, clearPerKey,
@@ -933,6 +1184,8 @@ const RGB = (() => {
     onPickDevice,
     listReportOptions, forceReportStrategy,
     setDongleMode, getDongleMode, getMode,
+    // Exposed for offline encoder tests / diagnostics only.
+    buildDongleChunks,
     effectNames: Object.keys(EFFECTS),
     hexToRgb, rgbToHex,
   };
