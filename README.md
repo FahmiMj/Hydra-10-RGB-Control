@@ -79,7 +79,8 @@ non-volatile storage and has been confirmed to stop keyboards typing.
 
 Decoded from the public [keylux protocol notes](https://github.com/SibteProf/keylux/blob/main/docs/PROTOCOL.md)
 and verified here on 2026-11-09 by lighting LED `0x37` (the `9` key) cyan on a
-Portronics Hydra 10 through the receiver.
+Portronics Hydra 10 through the receiver. The full-board 8-chunk path and the
+flicker fix below were verified on 2026-11-10.
 
 - **Interface:** interface 1, vendor usage page `0xFF02`.
 - **Channel:** HID **output report `0x13`**, 19-byte payload (20 bytes on the
@@ -102,14 +103,19 @@ Portronics Hydra 10 through the receiver.
   Solid cyan on LED `0x37` is `13 88 01 00 15 00 ff ff 01 37 … e7`.
 - **LED indices** are the same matrix indices the wired protocol uses
   (`0x37` = `9` on this 68-key layout).
+- **All 96 LED slots are sent**, exactly like the wired path: the 68 mapped
+  keys plus the 28 unmapped slots held at black. Omitting those 28 leaves the
+  keyboard's own firmware effect running on them, which shows up as a brief
+  onboard-RGB flash every few seconds. A full-board frame is therefore
+  8 chunks, and unchanged static frames are refreshed every second.
 
 The 7-byte feature report `#6` on usage page `0xFF04` is a **trap**: it uses
 the wired report ID but is only a status report. The app never writes to it.
 
-The link is throughput-limited. The app caps wireless output at roughly
-60 chunks/second (a 6-chunk full-board frame runs at ~10 fps) and skips
-unchanged frames. A smooth whole-board effect should still use the cable;
-static colours and sparse effects work well over radio.
+The link is throughput-limited. Animated effects are capped at roughly
+60 chunks/second; a static full-board frame costs ~8 chunks/s. A smooth
+whole-board animation should still use the cable; static colours and sparse
+effects work well over radio.
 
 If a different receiver exposes no output report `0x13`, the app refuses to
 write rather than probing unknown reports. Do **not** force other report IDs —
