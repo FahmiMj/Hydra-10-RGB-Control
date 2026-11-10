@@ -168,6 +168,7 @@ const RGB = (() => {
   let transport = loadTransport();
   let dongleWritesConfirmed = false;
   let sendIntervalMs = 0; // wired pacing only; the dongle paces by chunks/s
+  let lastTransportMode = null; // remembered across a physical transport switch
   let lastDongleKeyHash = null;
   let lastDongleFullAt = 0;
   let lastDongleFrameAt = 0;
@@ -630,6 +631,7 @@ const RGB = (() => {
 
       const pickedMode = transportMode(picked);
       sendIntervalMs = 0; // dongle pacing is handled per frame in sendDongleFrame
+      lastTransportMode = pickedMode;
       if (pickedMode === 'dongle') {
         // Fresh stream: force an initial 96-slot keyframe and reset pacing.
         lastDongleKeyHash = null;
@@ -1035,6 +1037,7 @@ const RGB = (() => {
   async function disconnect(auto) {
     stopStreaming();
     if (device) {
+      lastTransportMode = transportMode(device);
       try { device.removeEventListener('inputreport', onInputReport); } catch (e) {}
       try { await device.close(); } catch (e) {}
     }
@@ -1050,17 +1053,37 @@ const RGB = (() => {
     reconnectTimer = setTimeout(async () => {
       if (!navigator.hid) return;
       const known = await navigator.hid.getDevices();
-      const match = known.find(isHydra);
+      const hydra = known.filter(isHydra);
+      // One physical board exposes several interfaces. Only keep the ones that
+      // advertise a real RGB channel, or the receiver's boot-keyboard
+      // interface will be chosen forever and detection will never succeed.
+      const capable = hydra.filter(hasRgbReportChannel);
+      let candidates = capable.length ? capable : hydra;
+
+      // Prefer the transport we were just using, so a wired <-> dongle switch
+      // reconnects to the newly attached side instead of a stale one.
+      if (lastTransportMode) {
+        const preferred = candidates.filter((d) => transportMode(d) === lastTransportMode);
+        if (preferred.length) candidates = preferred;
+      }
+
+      const usable = candidates.filter(
+        (d) => transportMode(d) !== 'dongle' || dongleWritesConfirmed
+      );
+      if (!usable.length) {
+        if (candidates.some((d) => transportMode(d) === 'dongle')) {
+          log('2.4GHz receiver detected but writes are not allowed yet — tick "Allow RGB writes" and connect.', 'warn');
+        }
+        scheduleReconnect();
+        return;
+      }
+
+      const match = usable[0];
       if (match) {
         device = match;
         try {
           if (!device.opened) await device.open();
           const mode = transportMode(device);
-          if (mode === 'dongle' && !dongleWritesConfirmed) {
-            device = null;
-            scheduleReconnect();
-            return;
-          }
           const ok = await detectReportStrategy();
           if (ok) {
             sendIntervalMs = 0;
@@ -1069,6 +1092,7 @@ const RGB = (() => {
               lastDongleFullAt = 0;
               lastDongleFrameAt = 0;
             }
+            lastTransportMode = mode;
             device.addEventListener('inputreport', onInputReport);
             startStreaming();
             setStatus('connected', { name: device.productName, strategy: reportStrategy, mode });
