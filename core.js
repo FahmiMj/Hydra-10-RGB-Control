@@ -31,14 +31,17 @@ const RGB = (() => {
   const DONGLE_REPORT_ID = 0x13;
   const DONGLE_REPORT_SIZE = 19;
   const DONGLE_CHUNK = 14; // payload bytes per 19-byte output report
-  const DONGLE_MAX_CHUNKS = 10; // <= ~64 chunks/s at the paced frame interval
-  const DONGLE_CHUNK_GAP_MS = 13;
+  const DONGLE_MAX_CHUNKS = 10; // <- keep a single frame under the link budget
+  const DONGLE_CHUNK_GAP_MS = 13; // vendor-measured minimum, start-to-start
   const DONGLE_CMD_LIGHTING = 0x88; // the ONLY command this app ever sends
-  // Re-send an unchanged image at least this often. The board's firmware
-  // resumes its own effect after a quiet spell, which shows up as a brief
-  // onboard-RGB flash; refreshing well inside that window keeps host colours
-  // on top.
-  const DONGLE_STATIC_REFRESH_MS = 1000;
+  // Measured clean ceiling is ~64 chunks/s; 60 leaves a small safety margin.
+  // Pace by chunks, not frames: a sparse frame can run more often than a
+  // full-board one on the same link.
+  const DONGLE_CHUNKS_PER_SEC = 60;
+  // Re-send a full 96-slot frame at least this often. The unmapped slots are
+  // held black; refreshing them inside the firmware's repaint window keeps the
+  // keyboard's own effect from flashing through.
+  const DONGLE_KEYFRAME_MS = 1000;
 
   const DEFAULT_REPORT_ID = 6;
   const REPORT_SIZE = 519; // total payload length, including RGB data + padding
@@ -128,6 +131,9 @@ const RGB = (() => {
     { label: "Right", row: 4, x: 16.25, w: 1, ledIndex: 95, colFrac: 0.9571, nav: true },
   ];
   const LED_LAYOUT = KEY_LAYOUT.map((k) => k.ledIndex);
+  // 68 mapped key LEDs vs. all 96 matrix slots (the rest are held black).
+  const KEY_LED_INDICES = LED_LAYOUT;
+  const ALL_LED_INDICES = Array.from({ length: LED_COUNT }, (_, i) => i);
   const LAYOUT_TOTAL_W = 17.5; // key-units, for physical rendering
   const LAYOUT_ROWS = 5;
 
@@ -161,9 +167,10 @@ const RGB = (() => {
   // inspected the dongle and explicitly allowed them for this session.
   let transport = loadTransport();
   let dongleWritesConfirmed = false;
-  let sendIntervalMs = 0; // dongle links get throttled; wired stays unthrottled
-  let lastDongleHash = null;
-  let lastDongleSentAt = 0;
+  let sendIntervalMs = 0; // wired pacing only; the dongle paces by chunks/s
+  let lastDongleKeyHash = null;
+  let lastDongleFullAt = 0;
+  let lastDongleFrameAt = 0;
 
   const state = loadState();
 
@@ -380,13 +387,9 @@ const RGB = (() => {
     return hsvToRgb((hq / hSteps) * 360, sq, vq);
   }
 
-  function buildDongleGroups(perLed, palette) {
+  function buildDongleGroups(perLed, palette, indices) {
     const buckets = new Map();
-    // Cover the full LED slot space, not just the 68 mapped keys. The wired
-    // path paints all 96 slots every frame (unmapped ones stay black); if the
-    // dongle frame omits them, the keyboard's own firmware effect keeps
-    // running on those LEDs and flashes through the host colours.
-    for (let i = 0; i < LED_COUNT; i++) {
+    for (const i of indices) {
       let c = perLed[i] || [0, 0, 0];
       c = [c[0] | 0, c[1] | 0, c[2] | 0];
       if (!palette.exact) c = quantizeHsv(c, palette.h, palette.s, palette.v);
@@ -439,29 +442,28 @@ const RGB = (() => {
     { h: 1, s: 1, v: 1 },
   ];
 
-  function averageDongleGroups(perLed) {
+  function averageDongleGroups(perLed, indices) {
     let r = 0, g = 0, b = 0;
-    const indices = [];
-    for (let i = 0; i < LED_COUNT; i++) {
+    for (const i of indices) {
       const c = perLed[i] || [0, 0, 0];
       r += c[0]; g += c[1]; b += c[2];
-      indices.push(i);
     }
     return [{
-      color: [Math.round(r / LED_COUNT), Math.round(g / LED_COUNT), Math.round(b / LED_COUNT)],
+      color: [Math.round(r / indices.length), Math.round(g / indices.length), Math.round(b / indices.length)],
       indices,
     }];
   }
 
-  // Pick the richest palette that still fits the wireless chunk budget.
-  // Full frames (not deltas) keep the encoder simple; the link budget is
-  // enforced by DONGLE_MAX_CHUNKS + the per-chunk gap.
-  function buildDongleChunks(perLed) {
+  // Pick the richest palette that still fits one frame's chunk budget.
+  // `indices` lets the animation path send only the 68 key LEDs, while the
+  // periodic keyframe covers all 96 slots so the unmapped ones stay black.
+  function buildDongleChunks(perLed, indices) {
+    const slots = indices || ALL_LED_INDICES;
     for (const palette of DONGLE_PALETTES) {
-      const chunks = chunkDonglePayload(encodeDongleGroups(buildDongleGroups(perLed, palette)));
+      const chunks = chunkDonglePayload(encodeDongleGroups(buildDongleGroups(perLed, palette, slots)));
       if (chunks.length && chunks.length <= DONGLE_MAX_CHUNKS) return chunks;
     }
-    return chunkDonglePayload(encodeDongleGroups(averageDongleGroups(perLed)));
+    return chunkDonglePayload(encodeDongleGroups(averageDongleGroups(perLed, slots)));
   }
 
   function hashChunks(chunks) {
@@ -615,12 +617,18 @@ const RGB = (() => {
       }
 
       const pickedMode = transportMode(picked);
-      sendIntervalMs = pickedMode === 'dongle' ? 120 : 0; // wireless is chunk-paced
+      sendIntervalMs = 0; // dongle pacing is handled per frame in sendDongleFrame
+      if (pickedMode === 'dongle') {
+        // Fresh stream: force an initial 96-slot keyframe and reset pacing.
+        lastDongleKeyHash = null;
+        lastDongleFullAt = 0;
+        lastDongleFrameAt = 0;
+      }
       device.addEventListener('inputreport', onInputReport);
       bindVisibility();
       startStreaming();
       setStatus('connected', { name: device.productName, strategy: reportStrategy, mode: pickedMode });
-      log(`Streaming via ${reportStrategy.kind} report #${reportStrategy.reportId} (${reportStrategy.size}B) in ${pickedMode} mode${sendIntervalMs ? ` at <=${1000 / sendIntervalMs}fps` : ''}`);
+      log(`Streaming via ${reportStrategy.kind} report #${reportStrategy.reportId} (${reportStrategy.size}B) in ${pickedMode} mode`);
       return true;
     } catch (err) {
       const detail = {
@@ -875,6 +883,12 @@ const RGB = (() => {
 
   // Chunked 2.4GHz frame writer. Only DONGLE_CMD_LIGHTING (0x88) frames are
   // produced by buildDongleChunks(); the config command is unreachable here.
+  //
+  // Two frame shapes:
+  //   - animation frames: only the 68 mapped key LEDs (cheaper, higher cadence)
+  //   - keyframes: all 96 slots, including the unmapped ones held black
+  // A keyframe is forced every DONGLE_KEYFRAME_MS and whenever the content is
+  // static, which keeps the firmware effect from flashing through.
   async function sendDongleFrame(perLed, force) {
     if (!device || !device.opened || !reportStrategy) return false;
     // Live re-check: toggling "Allow RGB writes" off mid-stream must stop the
@@ -883,21 +897,30 @@ const RGB = (() => {
       log('Dongle writes are blocked — tick "Allow RGB writes" in Diagnostics to resume', 'warn');
       return false;
     }
-    const chunks = buildDongleChunks(perLed);
-    if (!chunks.length) return false;
+
     const now = performance.now();
-    const hash = hashChunks(chunks);
+    const keyChunks = buildDongleChunks(perLed, KEY_LED_INDICES);
+    if (!keyChunks.length) return false;
+    const keyHash = hashChunks(keyChunks);
+    const keyChanged = keyHash !== lastDongleKeyHash;
+    const keyframeDue = force || !lastDongleFullAt || now - lastDongleFullAt >= DONGLE_KEYFRAME_MS;
 
-    if (!force) {
-      if (sendIntervalMs && now - lastFrameTime < sendIntervalMs) return true;
-      // Static image: do not resend every tick. Refresh periodically in case
-      // the firmware repaints behind us.
-      if (hash === lastDongleHash && now - lastDongleSentAt < DONGLE_STATIC_REFRESH_MS) return true;
-    }
+    if (!force && !keyChanged && !keyframeDue) return true;
 
+    const useFull = keyframeDue;
+    const chunks = useFull ? buildDongleChunks(perLed, ALL_LED_INDICES) : keyChunks;
+    if (!chunks.length) return false;
+
+    // Budget by chunks per second, not frames. The whole frame (gaps included)
+    // counts, so a 6-chunk frame may start every ~100ms, an 8-chunk every ~133ms.
+    const budgetMs = chunks.length * (1000 / DONGLE_CHUNKS_PER_SEC);
+    if (!force && now - lastDongleFrameAt < budgetMs) return true;
+
+    lastDongleFrameAt = now;
     isSending = true;
     let ok = true;
     for (let i = 0; i < chunks.length; i++) {
+      const chunkStart = performance.now();
       try {
         await device.sendReport(DONGLE_REPORT_ID, chunks[i]);
       } catch (e) {
@@ -905,8 +928,12 @@ const RGB = (() => {
         log(`Dongle chunk ${i + 1}/${chunks.length} rejected: ${e.message || e}`, 'warn');
         break;
       }
-      // Space control transfers ~13ms apart; the frame time IS the gaps.
-      if (i < chunks.length - 1) await sleep(DONGLE_CHUNK_GAP_MS);
+      // Space write *starts* 13ms apart, matching the vendor's measured
+      // minimum. Sleeping the full gap after the transfer would be ~15ms.
+      if (i < chunks.length - 1) {
+        const elapsed = performance.now() - chunkStart;
+        if (elapsed < DONGLE_CHUNK_GAP_MS) await sleep(DONGLE_CHUNK_GAP_MS - elapsed);
+      }
     }
     isSending = false;
 
@@ -919,12 +946,9 @@ const RGB = (() => {
       return false;
     }
 
-    lastDongleHash = hash;
-    lastDongleSentAt = performance.now();
+    lastDongleKeyHash = keyHash;
+    if (useFull) lastDongleFullAt = performance.now();
     lastFrameTime = performance.now();
-    // 16ms per chunk keeps the link under ~64 chunks/s (the measured clean
-    // ceiling); sparse frames finish sooner and can tick faster.
-    sendIntervalMs = Math.max(100, chunks.length * 16);
     consecutiveFailures = 0;
     return true;
   }
@@ -1027,7 +1051,12 @@ const RGB = (() => {
           }
           const ok = await detectReportStrategy();
           if (ok) {
-            sendIntervalMs = mode === 'dongle' ? 120 : 0;
+            sendIntervalMs = 0;
+            if (mode === 'dongle') {
+              lastDongleKeyHash = null;
+              lastDongleFullAt = 0;
+              lastDongleFrameAt = 0;
+            }
             device.addEventListener('inputreport', onInputReport);
             startStreaming();
             setStatus('connected', { name: device.productName, strategy: reportStrategy, mode });

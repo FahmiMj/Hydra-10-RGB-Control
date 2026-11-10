@@ -103,19 +103,26 @@ flicker fix below were verified on 2026-11-10.
   Solid cyan on LED `0x37` is `13 88 01 00 15 00 ff ff 01 37 … e7`.
 - **LED indices** are the same matrix indices the wired protocol uses
   (`0x37` = `9` on this 68-key layout).
-- **All 96 LED slots are sent**, exactly like the wired path: the 68 mapped
-  keys plus the 28 unmapped slots held at black. Omitting those 28 leaves the
-  keyboard's own firmware effect running on them, which shows up as a brief
-  onboard-RGB flash every few seconds. A full-board frame is therefore
-  8 chunks, and unchanged static frames are refreshed every second.
+- **All 96 LED slots are covered**, exactly like the wired path: the 68 mapped
+  keys plus the 28 unmapped slots held at black. Animation frames carry only
+  the 68 key LEDs (cheaper, so they can run faster), while a full 96-slot
+  keyframe is sent every second. That keeps the keyboard's own firmware effect
+  from flashing through on the unmapped slots.
 
 The 7-byte feature report `#6` on usage page `0xFF04` is a **trap**: it uses
 the wired report ID but is only a status report. The app never writes to it.
 
-The link is throughput-limited. Animated effects are capped at roughly
-60 chunks/second; a static full-board frame costs ~8 chunks/s. A smooth
-whole-board animation should still use the cable; static colours and sparse
-effects work well over radio.
+The link is throughput-limited. Pacing is budgeted at 60 chunks/second, below
+the measured clean ceiling of ~64. In practice:
+
+| Content | Chunks | Wireless rate |
+| --- | --- | --- |
+| Uniform effect (Solid, Breathing, Spectrum) | 6 | ~10 fps |
+| Multi-colour effect (Rainbow, Pulse) | 7–10 | ~6–9 fps |
+| Full 96-slot keyframe | 8–10 | once per second |
+
+Wired remains ~30 fps. A smooth whole-board animation should still use the
+cable; static colours and sparse effects work well over radio.
 
 If a different receiver exposes no output report `0x13`, the app refuses to
 write rather than probing unknown reports. Do **not** force other report IDs —
