@@ -569,11 +569,18 @@ const RGB = (() => {
       }
 
       let picked = null;
+      let openFailures = 0;
       for (const d of vendorDevices) {
         device = d;
         try {
           if (!device.opened) await device.open();
         } catch (e) {
+          openFailures++;
+          log(
+            `Could not open ${d.productName || 'device'} (0x${d.vendorId.toString(16).toUpperCase()}:0x${d.productId.toString(16).toUpperCase()}): ${e.message || e}`,
+            'error'
+          );
+          log('On Linux this usually means /dev/hidraw* is root-only. Replug resets permissions; grant your user access or add a udev uaccess rule.', 'warn');
           continue;
         }
         const mode = transportMode(d);
@@ -607,8 +614,13 @@ const RGB = (() => {
       if (!picked) {
         device = null;
         reportStrategy = null;
-        setStatus('error', 'No working report strategy found');
-        log('Could not find a report the device accepts', 'error');
+        if (openFailures && openFailures === vendorDevices.length) {
+          setStatus('error', 'Could not open the device (permission denied)');
+          log('Every RGB interface failed to open — fix device permissions and connect again.', 'error');
+        } else {
+          setStatus('error', 'No working report strategy found');
+          log('Could not find a report the device accepts', 'error');
+        }
         return false;
       }
       // close interfaces we won't use
