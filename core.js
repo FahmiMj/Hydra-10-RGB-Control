@@ -34,6 +34,11 @@ const RGB = (() => {
   const DONGLE_MAX_CHUNKS = 10; // <= ~64 chunks/s at the paced frame interval
   const DONGLE_CHUNK_GAP_MS = 13;
   const DONGLE_CMD_LIGHTING = 0x88; // the ONLY command this app ever sends
+  // Re-send an unchanged image at least this often. The board's firmware
+  // resumes its own effect after a quiet spell, which shows up as a brief
+  // onboard-RGB flash; refreshing well inside that window keeps host colours
+  // on top.
+  const DONGLE_STATIC_REFRESH_MS = 1000;
 
   const DEFAULT_REPORT_ID = 6;
   const REPORT_SIZE = 519; // total payload length, including RGB data + padding
@@ -377,13 +382,17 @@ const RGB = (() => {
 
   function buildDongleGroups(perLed, palette) {
     const buckets = new Map();
-    for (const key of KEY_LAYOUT) {
-      let c = perLed[key.ledIndex] || [0, 0, 0];
+    // Cover the full LED slot space, not just the 68 mapped keys. The wired
+    // path paints all 96 slots every frame (unmapped ones stay black); if the
+    // dongle frame omits them, the keyboard's own firmware effect keeps
+    // running on those LEDs and flashes through the host colours.
+    for (let i = 0; i < LED_COUNT; i++) {
+      let c = perLed[i] || [0, 0, 0];
       c = [c[0] | 0, c[1] | 0, c[2] | 0];
       if (!palette.exact) c = quantizeHsv(c, palette.h, palette.s, palette.v);
       const k = `${c[0]},${c[1]},${c[2]}`;
       if (!buckets.has(k)) buckets.set(k, { color: c, indices: [] });
-      buckets.get(k).indices.push(key.ledIndex);
+      buckets.get(k).indices.push(i);
     }
     return Array.from(buckets.values());
   }
@@ -431,14 +440,16 @@ const RGB = (() => {
   ];
 
   function averageDongleGroups(perLed) {
-    let r = 0, g = 0, b = 0, n = 0;
-    for (const key of KEY_LAYOUT) {
-      const c = perLed[key.ledIndex] || [0, 0, 0];
-      r += c[0]; g += c[1]; b += c[2]; n++;
+    let r = 0, g = 0, b = 0;
+    const indices = [];
+    for (let i = 0; i < LED_COUNT; i++) {
+      const c = perLed[i] || [0, 0, 0];
+      r += c[0]; g += c[1]; b += c[2];
+      indices.push(i);
     }
     return [{
-      color: [Math.round(r / n), Math.round(g / n), Math.round(b / n)],
-      indices: KEY_LAYOUT.map((k) => k.ledIndex),
+      color: [Math.round(r / LED_COUNT), Math.round(g / LED_COUNT), Math.round(b / LED_COUNT)],
+      indices,
     }];
   }
 
@@ -879,9 +890,9 @@ const RGB = (() => {
 
     if (!force) {
       if (sendIntervalMs && now - lastFrameTime < sendIntervalMs) return true;
-      // Static image: do not resend every tick. Refresh every 2s in case the
-      // firmware repaints behind us.
-      if (hash === lastDongleHash && now - lastDongleSentAt < 2000) return true;
+      // Static image: do not resend every tick. Refresh periodically in case
+      // the firmware repaints behind us.
+      if (hash === lastDongleHash && now - lastDongleSentAt < DONGLE_STATIC_REFRESH_MS) return true;
     }
 
     isSending = true;
