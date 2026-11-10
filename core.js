@@ -169,6 +169,8 @@ const RGB = (() => {
   let dongleWritesConfirmed = false;
   let sendIntervalMs = 0; // wired pacing only; the dongle paces by chunks/s
   let lastTransportMode = null; // remembered across a physical transport switch
+  let preferredTransport = null; // one-shot hint for the next connect()
+  let pendingDevice = null; // device handed over by a WebHID 'connect' event
   let lastDongleKeyHash = null;
   let lastDongleFullAt = 0;
   let lastDongleFrameAt = 0;
@@ -494,11 +496,29 @@ const RGB = (() => {
       // auto-grants HID access, so getDevices() returns the board without the
       // picker). Fall back to the device chooser only if nothing is granted.
       let devices = [];
-      try {
-        devices = await navigator.hid.getDevices();
-        log(`getDevices(): ${devices.length} granted device(s)`);
-      } catch (e) {
-        log(`getDevices failed: ${e}`, 'warn');
+
+      // A WebHID 'connect' event hands us a live HIDDevice object that may not
+      // be visible through getDevices() until the next enumeration pass. Use it
+      // directly so a dongle -> wired switch does not fall through to the
+      // picker or silently reconnect to the old transport.
+      if (pendingDevice) {
+        const fresh = pendingDevice;
+        pendingDevice = null;
+        if (isHydra(fresh) && hasRgbReportChannel(fresh)) {
+          devices = [fresh];
+          log(`Using newly connected ${fresh.productName || 'Hydra 10'} [${transportMode(fresh).toUpperCase()}]`);
+        } else {
+          log('Ignoring newly connected device: not a supported RGB-capable Hydra 10', 'warn');
+        }
+      }
+
+      if (!devices.length) {
+        try {
+          devices = await navigator.hid.getDevices();
+          log(`getDevices(): ${devices.length} granted device(s)`);
+        } catch (e) {
+          log(`getDevices failed: ${e}`, 'warn');
+        }
       }
 
       // NEVER probe, link to, or auto-grant anything but supported Hydra
@@ -536,6 +556,15 @@ const RGB = (() => {
       const rgbCapable = devices.filter(hasRgbReportChannel);
       if (rgbCapable.length) devices = rgbCapable;
       log(`Interfaces with a verified RGB channel: ${devices.length}`);
+
+      // A physical transport change (cable in/out) sets a one-shot preference
+      // so switching does not stop at the "pick a device" dialog while the
+      // other transport is still enumerated.
+      if (preferredTransport) {
+        const preferred = devices.filter((d) => transportMode(d) === preferredTransport);
+        if (preferred.length) devices = preferred;
+        preferredTransport = null;
+      }
 
       // More than one Hydra 10 attached: hand them to the UI for selection
       // instead of silently grabbing the first unit. Falls back to the first
@@ -1108,6 +1137,24 @@ const RGB = (() => {
   if (typeof navigator !== 'undefined' && navigator.hid) {
     navigator.hid.addEventListener('disconnect', (e) => {
       if (device && e.device === device) disconnect(true);
+    });
+
+    // Dongle -> wired: the receiver stays enumerated, so no disconnect fires
+    // when the cable is plugged in. Follow the newly attached wired board.
+    navigator.hid.addEventListener('connect', async (e) => {
+      const d = e.device;
+      if (!d || !isHydra(d) || !hasRgbReportChannel(d)) return;
+      const nextMode = transportMode(d);
+      const currentMode = device ? transportMode(device) : null;
+      if (nextMode !== 'wired' || currentMode === 'wired') {
+        if (!device) scheduleReconnect();
+        return;
+      }
+      log('Wired keyboard attached — switching from 2.4GHz to wired');
+      preferredTransport = 'wired';
+      pendingDevice = d;
+      await disconnect(false);
+      await connect();
     });
   }
 
