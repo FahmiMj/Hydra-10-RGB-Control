@@ -496,6 +496,7 @@ const RGB = (() => {
       // auto-grants HID access, so getDevices() returns the board without the
       // picker). Fall back to the device chooser only if nothing is granted.
       let devices = [];
+      let fromConnectEvent = false;
 
       // A WebHID 'connect' event hands us a live HIDDevice object that may not
       // be visible through getDevices() until the next enumeration pass. Use it
@@ -504,6 +505,7 @@ const RGB = (() => {
       if (pendingDevice) {
         const fresh = pendingDevice;
         pendingDevice = null;
+        fromConnectEvent = true;
         if (isHydra(fresh) && hasRgbReportChannel(fresh)) {
           devices = [fresh];
           log(`Using newly connected ${fresh.productName || 'Hydra 10'} [${transportMode(fresh).toUpperCase()}]`);
@@ -543,8 +545,9 @@ const RGB = (() => {
       }
 
       // If dongle mode was requested but only the wired board is present, say
-      // so plainly instead of silently switching transport.
-      if (transport.dongle && devices.every((d) => transportMode(d) === 'wired')) {
+      // so plainly instead of silently switching transport. Skip the warning
+      // when a WebHID 'connect' event deliberately moved us to wired.
+      if (!fromConnectEvent && transport.dongle && devices.every((d) => transportMode(d) === 'wired')) {
         log('Dongle mode is on, but only the wired keyboard (0x258A:0x010C) is attached. Connect the 2.4GHz receiver, or unplug the cable and switch the board to 2.4GHz mode.', 'warn');
       }
 
