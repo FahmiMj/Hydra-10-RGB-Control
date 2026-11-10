@@ -1,0 +1,10 @@
+# Portronics Hydra 10 wired board and Compx 2.4GHz receiver
+# Give the active local session read/write access to their hidraw nodes, so
+# replugging / switching transports does not reset permissions to root-only.
+#
+# Install:
+#   sudo cp 70-hydra10-hidraw.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw
+KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", TAG+="uaccess"

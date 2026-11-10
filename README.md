@@ -75,6 +75,30 @@ Writes stay blocked until step 3. The app only ever sends lighting command
 `0x88`; it **never** sends the config command `0x04`, which writes
 non-volatile storage and has been confirmed to stop keyboards typing.
 
+#### Switching between wired and 2.4 GHz
+
+The app follows the physical transport, so you do not need to disconnect
+first:
+
+- **Dongle → wired:** plug the USB cable in. The new wired board is adopted
+  directly from the WebHID `connect` event, even before it appears in
+  `navigator.hid.getDevices()`.
+- **Wired → dongle:** unplug the cable. The app reconnects to the receiver
+  automatically, provided **Dongle mode** and **Allow RGB writes** are still
+  ticked. If they are not, it says so in the log instead of writing blindly.
+- **Receiver plugged in during a wired session:** the wired session is left
+  alone. Switching is driven by the cable, not by the receiver appearing.
+
+On Linux, replugging either device resets `/dev/hidraw*` permissions. Install
+the included `70-hydra10-hidraw.rules` (`TAG+="uaccess"`) so the active session
+keeps access and switching does not fail with a permission error:
+
+```sh
+sudo cp 70-hydra10-hidraw.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=hidraw
+```
+
 #### 2.4 GHz dongle protocol (verified)
 
 Decoded from the public [keylux protocol notes](https://github.com/SibteProf/keylux/blob/main/docs/PROTOCOL.md)
