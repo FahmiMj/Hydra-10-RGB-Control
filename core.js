@@ -925,7 +925,22 @@ const RGB = (() => {
     log(`inputreport id=${e.reportId} len=${e.data.byteLength}`, 'debug');
   }
 
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // Inter-chunk pacing must not depend on a main-thread timer: Chromium
+  // throttles page timers to roughly one wake-up per second once the tab is
+  // hidden, which stretches the 13ms chunk gap into a full second and stalls
+  // the wireless stream. Worker timers keep their precision while hidden, so
+  // route waits through the ticker Worker whenever it is running.
+  let waitSeq = 0;
+  const pendingWaits = new Map();
+
+  function sleep(ms) {
+    if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      const id = ++waitSeq;
+      pendingWaits.set(id, resolve);
+      worker.postMessage({ cmd: 'wait', id, ms });
+    });
+  }
 
   // Chunked 2.4GHz frame writer. Only DONGLE_CMD_LIGHTING (0x88) frames are
   // produced by buildDongleChunks(); the config command is unreachable here.
@@ -1204,7 +1219,21 @@ const RGB = (() => {
     try {
       worker = new Worker('ticker.js');
       worker.onmessage = (e) => {
-        if (e.data === 'tick') tick(performance.now());
+        const data = e.data;
+        if (data === 'tick') {
+          tick(performance.now());
+          return;
+        }
+        if (data && data.cmd === 'waited') {
+          const resolve = pendingWaits.get(data.id);
+          if (resolve) {
+            pendingWaits.delete(data.id);
+            resolve();
+          }
+        }
+      };
+      worker.onerror = (e) => {
+        log(`Ticker worker unavailable (${e.message || 'failed to load'}) — background pacing will fall back to page timers`, 'warn');
       };
       worker.postMessage({ cmd: 'start', fps: 30 });
     } catch (err) {
@@ -1216,6 +1245,11 @@ const RGB = (() => {
 
   function stopWorkerTicker() {
     if (!worker) return;
+    // Release any chunk-gap wait still in flight: the reply cannot arrive
+    // once the worker is gone, and a stuck await would leave isSending true
+    // and freeze the stream permanently.
+    for (const resolve of pendingWaits.values()) resolve();
+    pendingWaits.clear();
     worker.postMessage({ cmd: 'stop' });
     worker.terminate();
     worker = null;
