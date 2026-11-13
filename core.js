@@ -934,11 +934,26 @@ const RGB = (() => {
   const pendingWaits = new Map();
 
   function sleep(ms) {
-    if (!worker) return new Promise((resolve) => setTimeout(resolve, ms));
     return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      if (!worker) {
+        setTimeout(finish, ms);
+        return;
+      }
       const id = ++waitSeq;
-      pendingWaits.set(id, resolve);
+      pendingWaits.set(id, finish);
       worker.postMessage({ cmd: 'wait', id, ms });
+      // Safety net: a worker that never replies (failed to load, or killed
+      // mid-wait) must still release the frame, otherwise isSending stays
+      // true and the stream dies for good.
+      setTimeout(() => {
+        if (pendingWaits.delete(id)) finish();
+      }, ms + 1000);
     });
   }
 
