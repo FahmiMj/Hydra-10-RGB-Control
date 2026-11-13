@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "RGB control console for the Portronics Hydra 10 keyboard (WebHID)",
   "main": "main.js",
-  "author": "Fahmi",
+  "author": "FahmiMj <62835925+FahmiMj@users.noreply.github.com> (https://github.com/FahmiMj)",
   "license": "MIT",
   "repository": {
     "type": "git",
