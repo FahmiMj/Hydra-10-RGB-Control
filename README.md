@@ -31,6 +31,9 @@ the AULA F75); see [the dongle protocol](#24-ghz-dongle-protocol-verified).
   board's built-in animation.
 - **Diagnostics panel** — live report strategy, report options, a test-report
   sender, device info, an FPS counter, and a scrolling log.
+- **Wireless frame-size control** — the 2.4 GHz link lets you trade frame rate
+  for colour accuracy (6–10 chunks per frame, default 7), with stable colour
+  clustering so effects do not shimmer.
 - **Settings persistence** — color/effect/brightness/speed are saved across
   sessions via `localStorage`; unexpected disconnects auto-reconnect.
 
@@ -70,6 +73,8 @@ The receiver is a **separate USB device** (`Compx 3554:FA09`, product
    `3554`/`FA09`; only change them for a different receiver).
 3. Tick **Allow RGB writes over 2.4 GHz** and confirm the prompt.
 4. Connect and choose an effect.
+5. Still in Diagnostics, set **Frame size** if you want to trade motion for
+   colour accuracy (default 7; the table below explains the trade-off).
 
 Writes stay blocked until step 3. The app only ever sends lighting command
 `0x88`; it **never** sends the config command `0x04`, which writes
@@ -132,18 +137,39 @@ flicker fix below were verified on 2026-11-10.
   the 68 key LEDs (cheaper, so they can run faster), while a full 96-slot
   keyframe is sent every second. That keeps the keyboard's own firmware effect
   from flashing through on the unmapped slots.
-
 The 7-byte feature report `#6` on usage page `0xFF04` is a **trap**: it uses
 the wired report ID but is only a status report. The app never writes to it.
 
 The link is throughput-limited. Pacing is budgeted at 60 chunks/second, below
-the measured clean ceiling of ~64. In practice:
+the measured clean ceiling of ~64, and is measured from the start of each
+frame because the writes themselves already take ~13 ms per chunk.
 
-| Content | Chunks | Wireless rate |
-| --- | --- | --- |
-| Uniform effect (Solid, Breathing, Spectrum) | 6 | ~10 fps |
-| Multi-colour effect (Rainbow, Pulse) | 7–10 | ~6–9 fps |
-| Full 96-slot keyframe | 8–10 | once per second |
+The plugin names all 68 keys every frame, so a full-board frame can never be
+shorter than 6 chunks. That is the hard ceiling of roughly 10 fps on this
+transport. Whatever budget is left over is spent on colour detail:
+
+| Frame size | Colours per frame | Full-board rate | Avg colour error |
+| --- | --- | --- | --- |
+| 6 | 4 | ~9–10 fps | 35/255 (blocky) |
+| **7 (default)** | 7 | ~8 fps | 20/255 |
+| 8 | 11 | ~7 fps | 13/255 |
+| 10 | 18 | ~6 fps | 8/255 |
+
+A 2D rainbow is the worst case. Waves, gradients and solid colours look much
+better at the same setting because they contain fewer distinct colours; frames
+with fewer colours than the budget are sent losslessly, so a solid colour is
+never approximated.
+
+The **Frame size** slider in Diagnostics picks the chunk budget
+(6–10 chunks, default 7). Each frame's colours are clustered (median cut, then
+k-means seeded with the previous frame's centres) down to the number of groups
+that fit, so colours stay stable between frames instead of shimmering. Lower
+is smoother motion, higher matches the canvas more closely. The setting is
+saved with the rest of the UI state.
+
+The periodic 96-slot keyframe adds the 28 unmapped slots, so it runs 8–12
+chunks depending on the setting. It still reuses the palette chosen for the 68
+mapped keys, so colours do not pop when it goes out.
 
 Wired remains ~30 fps. A smooth whole-board animation should still use the
 cable; static colours and sparse effects work well over radio.

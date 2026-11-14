@@ -42,6 +42,14 @@ const RGB = (() => {
   // held black; refreshing them inside the firmware's repaint window keeps the
   // keyboard's own effect from flashing through.
   const DONGLE_KEYFRAME_MS = 1000;
+  // A full frame must name all 68 keys (68 bytes) plus 4 bytes per colour
+  // group, so it can never be shorter than 6 chunks (~10 fps on this link).
+  // Smooth mode spends whatever budget is left over on more colours.
+  const DONGLE_SMOOTH_MODE = true;
+  const DONGLE_FRAME_CHUNKS_MIN = 6;
+  const DONGLE_FRAME_CHUNKS_MAX = DONGLE_MAX_CHUNKS;
+  const DONGLE_FRAME_CHUNKS_DEFAULT = 7; // ~7 colours at ~8 fps
+  const DONGLE_BACKOFF_MS = 100; // pause after a rejected chunk
 
   const DEFAULT_REPORT_ID = 6;
   const REPORT_SIZE = 519; // total payload length, including RGB data + padding
@@ -134,6 +142,8 @@ const RGB = (() => {
   // 68 mapped key LEDs vs. all 96 matrix slots (the rest are held black).
   const KEY_LED_INDICES = LED_LAYOUT;
   const ALL_LED_INDICES = Array.from({ length: LED_COUNT }, (_, i) => i);
+  const KEY_LED_SET = new Set(KEY_LED_INDICES);
+  const UNMAPPED_LED_INDICES = ALL_LED_INDICES.filter((i) => !KEY_LED_SET.has(i));
   const LAYOUT_TOTAL_W = 17.5; // key-units, for physical rendering
   const LAYOUT_ROWS = 5;
 
@@ -174,8 +184,26 @@ const RGB = (() => {
   let lastDongleKeyHash = null;
   let lastDongleFullAt = 0;
   let lastDongleFrameAt = 0;
+  let lastDongleBudgetMs = 0; // length of the previous frame in ms of radio time
+  let dongleBackoffUntil = 0; // set after a rejected chunk, keeps us off a dead link
+  let dongleCenters = null; // last frame's colour clusters (smooth mode)
 
   const state = loadState();
+
+  function clampFrameChunks(value) {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return DONGLE_FRAME_CHUNKS_DEFAULT;
+    return Math.max(DONGLE_FRAME_CHUNKS_MIN, Math.min(DONGLE_FRAME_CHUNKS_MAX, n));
+  }
+
+  function resetDongleStream() {
+    lastDongleKeyHash = null;
+    lastDongleFullAt = 0;
+    lastDongleFrameAt = 0;
+    lastDongleBudgetMs = 0;
+    dongleBackoffUntil = 0;
+    dongleCenters = null;
+  }
 
   function loadTransport() {
     const fallback = { dongle: false, vid: DONGLE_VID, pid: DONGLE_PID };
@@ -199,12 +227,15 @@ const RGB = (() => {
       brightness: 100,
       speed: 50,
       perKey: {}, // ledIndex -> '#rrggbb'
+      frameChunks: DONGLE_FRAME_CHUNKS_DEFAULT, // 2.4GHz only: chunk budget per frame
     };
     try {
       const raw = localStorage.getItem('rgb-hud-state');
       if (!raw) return fallback;
       const parsed = JSON.parse(raw);
-      return { ...fallback, ...parsed };
+      const merged = { ...fallback, ...parsed };
+      merged.frameChunks = clampFrameChunks(merged.frameChunks);
+      return merged;
     } catch (e) {
       return fallback;
     }
@@ -481,6 +512,115 @@ const RGB = (() => {
   }
 
   // ---------------------------------------------------------------------
+  // Smooth mode — cluster each frame down to the chunk budget
+  // ---------------------------------------------------------------------
+  // Every animation frame still names all 68 keys, so the frame can never be
+  // shorter than 6 chunks. Instead of dropping colours with a fixed palette,
+  // the frame's actual colours are clustered into as many groups as the budget
+  // allows: fewer groups = shorter frame = higher cadence, more groups =
+  // closer to the canvas.
+
+  // Eye-weighted distance: green matters most, blue least.
+  function colorDistance(a, b) {
+    const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+    return 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+  }
+
+  function meanColor(list) {
+    let r = 0, g = 0, b = 0;
+    for (const p of list) { r += p[0]; g += p[1]; b += p[2]; }
+    const n = list.length || 1;
+    return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+  }
+
+  // Median cut: repeatedly split the box with the most colour spread.
+  function medianCut(pts, k) {
+    const boxes = [pts.slice()];
+    while (boxes.length < k) {
+      let bi = -1, bScore = 0, bCh = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        const box = boxes[i];
+        if (box.length < 2) continue;
+        for (let ch = 0; ch < 3; ch++) {
+          let lo = 255, hi = 0;
+          for (const p of box) { if (p[ch] < lo) lo = p[ch]; if (p[ch] > hi) hi = p[ch]; }
+          const score = (hi - lo) * box.length * (ch === 1 ? 2 : 1);
+          if (score > bScore) { bScore = score; bi = i; bCh = ch; }
+        }
+      }
+      if (bi < 0) break;
+      const box = boxes[bi];
+      box.sort((x, y) => x[bCh] - y[bCh]);
+      const mid = box.length >> 1;
+      boxes.splice(bi, 1, box.slice(0, mid), box.slice(mid));
+    }
+    return boxes.map(meanColor);
+  }
+
+  // Cluster `indices` into at most k groups. Seeding k-means with the previous
+  // frame's centres keeps the groups stable, so colours do not shimmer.
+  function clusterLedColors(perLed, indices, k, seeds) {
+    const pts = indices.map((i) => {
+      const c = perLed[i] || [0, 0, 0];
+      return [c[0] | 0, c[1] | 0, c[2] | 0];
+    });
+
+    const distinct = new Map();
+    for (let n = 0; n < pts.length; n++) {
+      const key = pts[n][0] + ',' + pts[n][1] + ',' + pts[n][2];
+      if (!distinct.has(key)) distinct.set(key, { color: pts[n], indices: [] });
+      distinct.get(key).indices.push(indices[n]);
+    }
+    // Fewer distinct colours than the budget: send it losslessly.
+    if (distinct.size <= k) return { groups: Array.from(distinct.values()), centers: null };
+
+    let centers = (seeds && seeds.length === k) ? seeds.map((c) => c.slice()) : medianCut(pts, k);
+    const assign = new Array(pts.length).fill(0);
+    for (let iter = 0; iter < 4; iter++) {
+      for (let n = 0; n < pts.length; n++) {
+        let best = 0, bestD = Infinity;
+        for (let c = 0; c < centers.length; c++) {
+          const d = colorDistance(pts[n], centers[c]);
+          if (d < bestD) { bestD = d; best = c; }
+        }
+        assign[n] = best;
+      }
+      if (iter === 3) break;
+      const members = centers.map(() => []);
+      for (let n = 0; n < pts.length; n++) members[assign[n]].push(pts[n]);
+      centers = centers.map((c, i) => (members[i].length ? meanColor(members[i]) : c));
+    }
+
+    const out = centers.map((c) => ({ color: c, indices: [] }));
+    for (let n = 0; n < pts.length; n++) out[assign[n]].indices.push(indices[n]);
+    return { groups: out.filter((g) => g.indices.length), centers };
+  }
+
+  // How many colour groups fit in `chunks` chunks once the 68 key indices are
+  // paid for. Keyframes add the 28 unmapped slots on top, so they run 1-2
+  // chunks longer than the budget; that refresh is what keeps the firmware
+  // effect from flashing through, so it is worth the extra chunks.
+  function groupBudget(chunks) {
+    return Math.max(1, Math.floor((chunks * DONGLE_CHUNK - KEY_LED_INDICES.length) / 4));
+  }
+
+  // One smooth frame. `withUnmapped` paints the 28 slots without a key black on
+  // keyframes.
+  function buildSmoothFrame(perLed, withUnmapped) {
+    const chunks = clampFrameChunks(state.frameChunks);
+    const res = clusterLedColors(perLed, KEY_LED_INDICES, groupBudget(chunks), dongleCenters);
+    dongleCenters = res.centers;
+    const groups = res.groups;
+
+    if (withUnmapped && UNMAPPED_LED_INDICES.length) {
+      const black = groups.find((g) => g.color[0] === 0 && g.color[1] === 0 && g.color[2] === 0);
+      if (black) black.indices = black.indices.concat(UNMAPPED_LED_INDICES);
+      else groups.push({ color: [0, 0, 0], indices: UNMAPPED_LED_INDICES.slice() });
+    }
+    return { chunks: chunkDonglePayload(encodeDongleGroups(groups)), groups };
+  }
+
+  // ---------------------------------------------------------------------
   // Transport — connect, strategy auto-detection, send
   // ---------------------------------------------------------------------
   async function connect() {
@@ -666,9 +806,7 @@ const RGB = (() => {
       lastTransportMode = pickedMode;
       if (pickedMode === 'dongle') {
         // Fresh stream: force an initial 96-slot keyframe and reset pacing.
-        lastDongleKeyHash = null;
-        lastDongleFullAt = 0;
-        lastDongleFrameAt = 0;
+        resetDongleStream();
       }
       device.addEventListener('inputreport', onInputReport);
       bindVisibility();
@@ -958,7 +1096,8 @@ const RGB = (() => {
   }
 
   // Chunked 2.4GHz frame writer. Only DONGLE_CMD_LIGHTING (0x88) frames are
-  // produced by buildDongleChunks(); the config command is unreachable here.
+  // produced by buildDongleChunks()/buildSmoothFrame(); the config command is
+  // unreachable here.
   //
   // Two frame shapes:
   //   - animation frames: only the 68 mapped key LEDs (cheaper, higher cadence)
@@ -975,24 +1114,41 @@ const RGB = (() => {
     }
 
     const now = performance.now();
-    const keyChunks = buildDongleChunks(perLed, KEY_LED_INDICES);
-    if (!keyChunks.length) return false;
-    const keyHash = hashChunks(keyChunks);
-    const keyChanged = keyHash !== lastDongleKeyHash;
+
+    // Pace first, before building anything. Building a frame costs 68 colour
+    // reads plus clustering; while the radio is still busy that work would be
+    // thrown away, and the frame we eventually send would be built from a
+    // stale canvas. The budget is measured from the START of the previous
+    // frame because the writes themselves already take 13ms per chunk.
+    if (!force) {
+      if (now < dongleBackoffUntil) return true;
+      if (now - lastDongleFrameAt < lastDongleBudgetMs) return true;
+    }
+
     const keyframeDue = force || !lastDongleFullAt || now - lastDongleFullAt >= DONGLE_KEYFRAME_MS;
+    let chunks;
+    let keyHash = null;
 
-    if (!force && !keyChanged && !keyframeDue) return true;
-
-    const useFull = keyframeDue;
-    const chunks = useFull ? buildDongleChunks(perLed, ALL_LED_INDICES) : keyChunks;
+    if (DONGLE_SMOOTH_MODE) {
+      chunks = buildSmoothFrame(perLed, keyframeDue).chunks;
+      if (!keyframeDue) {
+        keyHash = hashChunks(chunks);
+        if (keyHash === lastDongleKeyHash) return true; // unchanged frame
+      }
+    } else {
+      const keyChunks = buildDongleChunks(perLed, KEY_LED_INDICES);
+      if (!keyChunks.length) return false;
+      keyHash = hashChunks(keyChunks);
+      const keyChanged = keyHash !== lastDongleKeyHash;
+      if (!force && !keyChanged && !keyframeDue) return true;
+      chunks = keyframeDue ? buildDongleChunks(perLed, ALL_LED_INDICES) : keyChunks;
+    }
     if (!chunks.length) return false;
 
-    // Budget by chunks per second, not frames. The whole frame (gaps included)
-    // counts, so a 6-chunk frame may start every ~100ms, an 8-chunk every ~133ms.
-    const budgetMs = chunks.length * (1000 / DONGLE_CHUNKS_PER_SEC);
-    if (!force && now - lastDongleFrameAt < budgetMs) return true;
-
+    // Budget by chunks per second, not frames. A 6-chunk frame may start every
+    // ~100ms, an 8-chunk frame every ~133ms.
     lastDongleFrameAt = now;
+    lastDongleBudgetMs = chunks.length * (1000 / DONGLE_CHUNKS_PER_SEC);
     isSending = true;
     let ok = true;
     for (let i = 0; i < chunks.length; i++) {
@@ -1014,6 +1170,9 @@ const RGB = (() => {
     isSending = false;
 
     if (!ok) {
+      // Do not hammer a link that just rejected a write; give the radio (or
+      // the user's transport switch) a moment before the next attempt.
+      dongleBackoffUntil = performance.now() + DONGLE_BACKOFF_MS;
       consecutiveFailures++;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         consecutiveFailures = 0;
@@ -1022,8 +1181,8 @@ const RGB = (() => {
       return false;
     }
 
-    lastDongleKeyHash = keyHash;
-    if (useFull) lastDongleFullAt = performance.now();
+    if (keyHash !== null) lastDongleKeyHash = keyHash;
+    if (keyframeDue) lastDongleFullAt = performance.now();
     lastFrameTime = performance.now();
     consecutiveFailures = 0;
     return true;
@@ -1150,9 +1309,7 @@ const RGB = (() => {
           if (ok) {
             sendIntervalMs = 0;
             if (mode === 'dongle') {
-              lastDongleKeyHash = null;
-              lastDongleFullAt = 0;
-              lastDongleFrameAt = 0;
+              resetDongleStream();
             }
             lastTransportMode = mode;
             device.addEventListener('inputreport', onInputReport);
@@ -1301,6 +1458,19 @@ const RGB = (() => {
     state.speed = Math.max(0, Math.min(100, pct));
     saveState();
   }
+  // 2.4GHz only: chunk budget per frame. Lower = shorter frames = smoother
+  // motion; higher = more colour groups = closer to the canvas.
+  function setFrameChunks(n) {
+    const next = clampFrameChunks(n);
+    if (next === state.frameChunks) return next;
+    state.frameChunks = next;
+    saveState();
+    // The budget changed, so last frame's clusters no longer line up and the
+    // cached hash is meaningless. Rebuild from scratch on the next frame.
+    dongleCenters = null;
+    lastDongleKeyHash = null;
+    return next;
+  }
   function setPerKeyColor(ledIndex, hex) {
     state.perKey[ledIndex] = hex;
     saveState();
@@ -1389,12 +1559,14 @@ const RGB = (() => {
     LED_LAYOUT, KEY_LAYOUT, LAYOUT_TOTAL_W, LAYOUT_ROWS,
     connect, disconnect, sendTestReport,
     setEffect, setColor, setBrightness, setSpeed, setPerKeyColor, clearPerKey,
+    setFrameChunks,
     getState, onStatus, onFrame, onLog, onFps,
     onPickDevice,
     listReportOptions, forceReportStrategy,
     setDongleMode, getDongleMode, getMode,
     // Exposed for offline encoder tests / diagnostics only.
     buildDongleChunks,
+    buildSmoothFrame,
     effectNames: Object.keys(EFFECTS),
     hexToRgb, rgbToHex,
   };

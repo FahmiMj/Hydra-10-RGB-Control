@@ -171,6 +171,15 @@
           <input type="checkbox" id="dongle-writes" />
           <span>Allow RGB writes over 2.4&nbsp;GHz</span>
         </label>
+
+        <div class="debug-field">
+          <span>Frame size <span id="frame-chunks-value" class="slider-value">7</span></span>
+        </div>
+        <div class="slider-row">
+          <input type="range" id="frame-chunks" class="hud-slider" min="6" max="10" step="1" value="7" />
+        </div>
+        <p class="debug-note" id="frame-chunks-note"></p>
+
         <p class="debug-note">Compx <code>3554:FA09</code> is auto-detected. Writes use only lighting command <code>0x88</code>; config writes are never sent.</p>
 
         <button id="inspect-btn" class="btn btn-outline" type="button">Inspect HID devices (read-only)</button>

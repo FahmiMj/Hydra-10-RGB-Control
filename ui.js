@@ -45,6 +45,7 @@
     bindControls();
     bindDebugPanel();
     bindDongleControls();
+    bindFrameSize();
     bindGimbalDrag();
     hydrateFromState();
 
@@ -525,6 +526,34 @@
     });
 
     sync();
+  }
+
+  // 2.4GHz frame size: the chunk budget per frame. More chunks = more colour
+  // groups = closer to the canvas, but fewer frames per second.
+  function bindFrameSize() {
+    const slider = $('#frame-chunks');
+    const value = $('#frame-chunks-value');
+    const note = $('#frame-chunks-note');
+    if (!slider) return;
+
+    const coloursFor = (chunks) => Math.max(1, Math.floor((chunks * 14 - RGB.LED_LAYOUT.length) / 4));
+    const describe = (v) => {
+      const colours = coloursFor(v);
+      const fps = Math.max(1, Math.floor(60 / v));
+      return `${v} chunks · ${colours} colour${colours === 1 ? '' : 's'} · ~${fps} fps on the radio. ` +
+        'Wireless only: lower is smoother motion, higher matches the canvas more closely.';
+    };
+
+    const apply = (v) => {
+      const next = RGB.setFrameChunks(v);
+      slider.value = next;
+      if (value) value.textContent = next;
+      slider.style.setProperty('--fill', `${((next - 6) / 4) * 100}%`);
+      if (note) note.textContent = describe(next);
+    };
+
+    slider.addEventListener('input', (e) => apply(Number(e.target.value)));
+    apply(RGB.getState().frameChunks);
   }
 
   function reportSizeBytes(report) {
